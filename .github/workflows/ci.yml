@@ -1,0 +1,22 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependency-boundary tooling
+        run: command -v rg >/dev/null || brew install ripgrep
+      - name: Check dependency boundaries
+        run: ./Scripts/check-dependency-boundaries.sh
+      - name: Run tests
+        run: swift test
