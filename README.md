@@ -18,7 +18,7 @@ Add the package in Xcode or to your `Package.swift`:
 dependencies: [
   .package(
     url: "https://github.com/indexedlabs/electric-sync-swift.git",
-    from: "0.1.5"
+    from: "0.1.6"
   )
 ]
 ```
@@ -52,6 +52,16 @@ swift test
 ```
 
 The library target intentionally imports only Foundation and CryptoKit and has no SwiftPM target dependencies. GRDB is used only by the test target.
+
+## Origins and attribution
+
+Electric Sync for Swift is an independent Swift port. It adapts collection and
+query behavior from [TanStack DB](https://github.com/TanStack/db) and implements
+the [Electric](https://github.com/electric-sql/electric) Shape protocol and
+client semantics. It is not affiliated with or endorsed by either project.
+
+See [NOTICE](NOTICE) for the applicable third-party copyright and license
+notices.
 
 ## License
 
