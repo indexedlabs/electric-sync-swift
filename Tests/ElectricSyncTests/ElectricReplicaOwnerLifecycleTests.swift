@@ -1522,7 +1522,9 @@ struct ElectricReplicaOwnerLifecycleTests {
         table: TaggedReplicaTestRecord.tableName,
         rowKey: staleRecord.id
       )
-      let subsetPredicate = SQLExpression("id = 'subset'")
+      let subsetPredicate = SQLExpression(
+        predicate: .equals(field: "id", value: .string("subset"))
+      )
       // This row and coverage belong to the stale generation. Recovery must
       // replace them atomically with the demanded subset, without fetching the
       // collection's unscoped history first.
@@ -1538,7 +1540,8 @@ struct ElectricReplicaOwnerLifecycleTests {
       let recoveryRequests = await harness.http.capturedRequests()
       #expect(recoveryRequests.count == 1)
       #expect(recoveryRequests[0].offset == "now")
-      #expect(recoveryRequests[0].subset != nil)
+      #expect(recoveryRequests[0].subset?.whereClause == "id = $1")
+      #expect(recoveryRequests[0].subset?.paramsJSON == #"{"1":"subset"}"#)
       #expect(recoveryRequests[0].log == .changesOnly)
       #expect(!recoveryRequests.contains { $0.subset == nil && $0.log == nil })
 
@@ -1566,6 +1569,69 @@ struct ElectricReplicaOwnerLifecycleTests {
           )
         )
       )
+    }
+  }
+
+  @Test
+  func semanticEpochTransitionStillFullBootstrapsBeforeOnDemandSubset() async throws {
+    let sessionController = TestSessionController()
+    do {
+      let bootstrapRecord = TaggedReplicaTestRecord(id: "bootstrap", name: "Bootstrap")
+      let subsetRecord = TaggedReplicaTestRecord(id: "subset", name: "Subset")
+      let harness = ReplicaHarness<TaggedReplicaTestRecord>(
+        responses: [
+          [
+            ElectricMessage.replicaRecord(
+              bootstrapRecord,
+              offset: "offset-bootstrap",
+              tags: ["shape"]
+            ),
+            ElectricMessage.replicaUpToDate(offset: "offset-bootstrap"),
+          ],
+          [
+            ElectricMessage.replicaRecord(
+              subsetRecord,
+              offset: "offset-subset",
+              tags: ["shape"],
+              isSubsetSnapshot: true
+            ),
+            ElectricMessage.replicaSubsetEnd(offset: "offset-subset"),
+          ],
+        ],
+        syncMode: .onDemand,
+        isExactCursorCutoverEnabled: true,
+        protocolCapabilityPolicy: .enabled,
+        shapeTopology: .staticallySimple
+      )
+      let replica = harness.collection.replica
+      try harness.metadata.updateSyncState(
+        collectionId: replica.identity.persistedCursorKey,
+        state: SyncState(
+          offset: "offset-legacy",
+          handle: "handle-legacy",
+          cursor: "cursor-legacy",
+          isUpToDate: true,
+          lastSyncedAt: Date(),
+          protocolSemanticEpoch: .legacy
+        ),
+        transaction: nil
+      )
+      let snapshot = try #require(sessionController.captureAuthenticatedSession())
+
+      let subset = try await harness.collection.ensureSubset(
+        where: SQLExpression("id = 'subset'"),
+        session: snapshot
+      )
+
+      #expect(subset.appliedRecords == [subsetRecord])
+      let requests = await harness.http.capturedRequests()
+      #expect(requests.count == 2)
+      #expect(requests[0].offset == "-1")
+      #expect(requests[0].subset == nil)
+      #expect(requests[0].log == nil)
+      #expect(requests[1].offset == "offset-bootstrap")
+      #expect(requests[1].subset != nil)
+      #expect(requests[1].log == .changesOnly)
     }
   }
 
