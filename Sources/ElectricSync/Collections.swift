@@ -1621,9 +1621,9 @@ actor ElectricCollectionBackgroundCoordinator<T: ElectricCollectionModel> {
       let truncateSwapPrepared = MutableValueBox(false)
       var refetchAfterTruncate = false
       var mustFullBootstrapForSemanticEpochTransition = false
-      let initiallyRequiresFullBootstrapForTrackerContinuity: Bool
+      let initiallyRequiresTrackerContinuityRecovery: Bool
       if progressiveGeneration == nil, snapshotReplica?.isTrackerContinuityUnavailable == true {
-        initiallyRequiresFullBootstrapForTrackerContinuity =
+        initiallyRequiresTrackerContinuityRecovery =
           try await client
           .requiresFullBootstrapForTrackerContinuity(
             T.self,
@@ -1637,9 +1637,24 @@ actor ElectricCollectionBackgroundCoordinator<T: ElectricCollectionModel> {
             shapeTopology: shapeTopology
           )
       } else {
-        initiallyRequiresFullBootstrapForTrackerContinuity = false
+        initiallyRequiresTrackerContinuityRecovery = false
       }
-      var mustFullBootstrapForTrackerContinuity = initiallyRequiresFullBootstrapForTrackerContinuity
+      var mustRecoverTrackerContinuity = initiallyRequiresTrackerContinuityRecovery
+      var prefersDemandedSubsetResetForTrackerContinuity =
+        if initiallyRequiresTrackerContinuityRecovery {
+          await client.prefersDemandedSubsetResetForTrackerContinuity(
+            identity: snapshotReplica?.identity
+              ?? ElectricReplicaIdentity(
+                modelType: T.self,
+                modelIdentifier: T.collectionIdentifier,
+                basePredicate: basePredicate
+              ),
+            syncMode: syncMode,
+            shapeTopology: shapeTopology
+          )
+        } else {
+          false
+        }
       let markQueryTruncateSwapPending: @Sendable (Bool) -> Void = { isPending in
         guard pendingTruncateSwap.value != isPending else { return }
         pendingTruncateSwap.value = isPending
@@ -1652,15 +1667,16 @@ actor ElectricCollectionBackgroundCoordinator<T: ElectricCollectionModel> {
         markQueryTruncateSwapPending(false)
       }
 
-      let armQueryReplacementForForcedBootstrapIfNeeded: @Sendable () async -> Void = {
+      let armQueryReplacementIfNeeded: @Sendable (String) async -> Void = { recovery in
         guard !pendingTruncateSwap.value else { return }
         self.logger.log(
           .warning,
-          message: "Electric replacement reset pre-armed before forced bootstrap (query)",
+          message: "Electric replacement reset pre-armed before recovery snapshot (query)",
           metadata: [
             "table": T.tableName,
             "collection": self.collectionIdentifier,
             "predicate": descriptor.predicate?.rawValue ?? "<nil>",
+            "recovery": recovery,
           ]
         )
         await eventHandler.willReceiveTruncate(
@@ -1683,11 +1699,25 @@ actor ElectricCollectionBackgroundCoordinator<T: ElectricCollectionModel> {
             ownerSnapshotDemand
             ? "\(ownerDemandNetworkRequestCount.value)"
             : "<not_owner_demand>"
+          let hasDemandedSubset =
+            descriptor.predicate != nil
+            || !descriptor.orderBy.isEmpty
+            || descriptor.limit != nil
+            || descriptor.cursor != nil
+          let canUseDemandedSubsetReset =
+            prefersDemandedSubsetResetForTrackerContinuity && hasDemandedSubset
+          let requiresDemandedSubsetReset =
+            mustRecoverTrackerContinuity
+            && canUseDemandedSubsetReset
+            && !mustFullBootstrapForSemanticEpochTransition
           let requiresForcedFullBootstrap =
-            mustFullBootstrapForTrackerContinuity
+            (mustRecoverTrackerContinuity
+              && !canUseDemandedSubsetReset)
             || mustFullBootstrapForSemanticEpochTransition
           if requiresForcedFullBootstrap {
-            await armQueryReplacementForForcedBootstrapIfNeeded()
+            await armQueryReplacementIfNeeded("full_bootstrap")
+          } else if requiresDemandedSubsetReset {
+            await armQueryReplacementIfNeeded("demanded_subset")
           }
           let fetchStart = self.runtimeProvider.now()
           let fetchSpanAttributes: [String: String] = [
@@ -1715,6 +1745,19 @@ actor ElectricCollectionBackgroundCoordinator<T: ElectricCollectionModel> {
                     syncMode: self.syncMode,
                     live: false,
                     forceFullBootstrap: true,
+                    replicaIdentity: snapshotReplica?.identity
+                  )
+                } else if requiresDemandedSubsetReset {
+                  try await client.requestSnapshot(
+                    T.self,
+                    basePredicate: basePredicate,
+                    shapeTopology: shapeTopology,
+                    descriptor: descriptor,
+                    syncMode: self.syncMode,
+                    coverageSyncMode: demandSyncMode ?? self.syncMode,
+                    restartOnDemandFromNow: true,
+                    consultFetchCoverage: false,
+                    recordAsObservation: recordAsObservation,
                     replicaIdentity: snapshotReplica?.identity
                   )
                 } else if progressiveGeneration != nil {
@@ -1752,7 +1795,18 @@ actor ElectricCollectionBackgroundCoordinator<T: ElectricCollectionModel> {
               return loadedBatch
             }
           } catch ElectricSyncError.trackerContinuityBootstrapRequired {
-            mustFullBootstrapForTrackerContinuity = true
+            mustRecoverTrackerContinuity = true
+            prefersDemandedSubsetResetForTrackerContinuity =
+              await client.prefersDemandedSubsetResetForTrackerContinuity(
+                identity: snapshotReplica?.identity
+                  ?? ElectricReplicaIdentity(
+                    modelType: T.self,
+                    modelIdentifier: T.collectionIdentifier,
+                    basePredicate: basePredicate
+                  ),
+                syncMode: self.syncMode,
+                shapeTopology: shapeTopology
+              )
             continue
           } catch ElectricSyncError.capabilitySemanticEpochTransitionDeferred
             where progressiveGeneration == nil
@@ -1792,6 +1846,7 @@ actor ElectricCollectionBackgroundCoordinator<T: ElectricCollectionModel> {
           let applyStart = self.runtimeProvider.now()
           let replacesSnapshotState =
             requiresForcedFullBootstrap
+            || requiresDemandedSubsetReset
             || batch.containsFullSnapshotBoundary
           let chunks = batch.chunked(maxMessages: electricBatchApplyChunkSize)
           let didEncounterTruncate = MutableValueBox(false)
@@ -2047,7 +2102,10 @@ actor ElectricCollectionBackgroundCoordinator<T: ElectricCollectionModel> {
           let applyFetchedBatchAndUpdateSnapshotTracking: () async throws -> [T] = {
             let records = try await applyFetchedBatch()
             guard !didEncounterTruncate.value, let snapshotReplica else { return records }
-            if replacesSnapshotState {
+            if requiresDemandedSubsetReset {
+              await snapshotReplica.clearSnapshotTrackers()
+              await snapshotReplica.installSnapshotTracker(messages: batch.messages)
+            } else if replacesSnapshotState {
               await snapshotReplica.clearSnapshotTrackers()
             } else {
               await snapshotReplica.installSnapshotTracker(messages: batch.messages)
@@ -2086,11 +2144,15 @@ actor ElectricCollectionBackgroundCoordinator<T: ElectricCollectionModel> {
             continue
           }
 
-          if mustFullBootstrapForTrackerContinuity || mustFullBootstrapForSemanticEpochTransition {
-            mustFullBootstrapForTrackerContinuity = false
+          if mustRecoverTrackerContinuity || mustFullBootstrapForSemanticEpochTransition {
+            mustRecoverTrackerContinuity = false
+            prefersDemandedSubsetResetForTrackerContinuity = false
             mustFullBootstrapForSemanticEpochTransition = false
             refetchAfterTruncate = false
             snapshotReplica?.markTrackerContinuityEstablished()
+            if requiresDemandedSubsetReset {
+              return appliedRecords
+            }
             continue
           }
 

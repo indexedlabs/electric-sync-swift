@@ -995,6 +995,68 @@ struct ElectricReplicaOwnerLifecycleTests {
   }
 
   @Test
+  func cancellingDemandedSubsetResetLeavesStaleGenerationAndNeverRequestsFullHistory()
+    async throws
+  {
+    let sessionController = TestSessionController()
+    do {
+      let harness = ReplicaHarness<TaggedReplicaTestRecord>(
+        responses: [],
+        syncMode: .onDemand,
+        isExactCursorCutoverEnabled: true,
+        cancellationAwareBlockedRequestIndex: 1,
+        protocolCapabilityPolicy: .enabled,
+        shapeTopology: .staticallySimple,
+        trackerRebuildAdmissionError: true
+      )
+      let replica = harness.collection.replica
+      try harness.metadata.updateSyncState(
+        collectionId: replica.identity.persistedCursorKey,
+        state: SyncState(
+          offset: "offset-stale",
+          handle: "handle-stale",
+          cursor: "cursor-stale",
+          isUpToDate: true,
+          lastSyncedAt: Date(),
+          protocolSemanticEpoch: .taggedShape1_7_7
+        ),
+        transaction: nil
+      )
+      harness.store.upsert(id: "stale", name: "Stale generation")
+      harness.metadata.seedOwnedRow(
+        table: TaggedReplicaTestRecord.tableName,
+        rowKey: "stale"
+      )
+
+      let snapshot = try #require(sessionController.captureAuthenticatedSession())
+      let subsetTask = Task {
+        try await harness.collection.ensureSubset(
+          where: SQLExpression("id = 'today'"),
+          session: snapshot
+        )
+      }
+      try await waitUntilTrueAsync { await harness.http.requestCount() == 1 }
+      let request = try #require(await harness.http.capturedRequests().first)
+      #expect(request.offset == "now")
+      #expect(request.subset != nil)
+      #expect(request.log == .changesOnly)
+      #expect(replica.ownerState == .replacing)
+
+      await harness.http.cancelBlockedFetchForTest()
+      try await waitUntilTrueAsync { await harness.http.cancelledFetchCount() == 1 }
+      await #expect(throws: CancellationError.self) {
+        try await subsetTask.value
+      }
+
+      try await waitUntilTrue { replica.ownerState != .replacing }
+      #expect(harness.store.storedIDs() == ["stale"])
+      #expect(replica.isTrackerContinuityUnavailable)
+      let requests = await harness.http.capturedRequests()
+      #expect(!requests.contains { $0.subset == nil && $0.log == nil })
+    }
+  }
+
+  @Test
   func sharedTableColdOwnerSubsetUsesExactPersistedCursorWithoutFullBootstrap() async throws {
     let sessionController = TestSessionController()
     do {
@@ -1092,18 +1154,14 @@ struct ElectricReplicaOwnerLifecycleTests {
   }
 
   @Test
-  func freshOnDemandStaticSimpleOwnerFullBootstrapsWhenPristineAdmissionRefuses() async throws {
+  func freshOnDemandStaticSimpleOwnerUsesDemandedSubsetWhenPristineAdmissionRefuses()
+    async throws
+  {
     let sessionController = TestSessionController()
     do {
-      let bootstrapRecord = TaggedReplicaTestRecord(id: "bootstrap", name: "Bootstrap")
       let subsetRecord = TaggedReplicaTestRecord(id: "today", name: "Today")
       let harness = ReplicaHarness<TaggedReplicaTestRecord>(
         responses: [
-          [
-            ElectricMessage.replicaRecord(
-              bootstrapRecord, offset: "offset-bootstrap", tags: ["shape"]),
-            ElectricMessage.replicaUpToDate(offset: "offset-bootstrap"),
-          ],
           [
             ElectricMessage.replicaRecord(
               subsetRecord,
@@ -1112,7 +1170,7 @@ struct ElectricReplicaOwnerLifecycleTests {
               isSubsetSnapshot: true
             ),
             ElectricMessage.replicaSubsetEnd(offset: "offset-today"),
-          ],
+          ]
         ],
         syncMode: .onDemand,
         isExactCursorCutoverEnabled: true,
@@ -1141,13 +1199,12 @@ struct ElectricReplicaOwnerLifecycleTests {
 
       #expect(subset.appliedRecords == [subsetRecord])
       let requests = await harness.http.capturedRequests()
-      #expect(requests.count == 2)
-      #expect(requests[0].offset == "-1")
-      #expect(requests[0].subset == nil)
-      #expect(requests[0].log == nil)
-      #expect(requests[1].offset == "offset-bootstrap")
-      #expect(requests[1].subset != nil)
-      #expect(harness.store.storedIDs() == [bootstrapRecord.id, subsetRecord.id])
+      #expect(requests.count == 1)
+      #expect(requests[0].offset == "now")
+      #expect(requests[0].subset != nil)
+      #expect(requests[0].log == .changesOnly)
+      #expect(!requests.contains { $0.subset == nil && $0.log == nil })
+      #expect(harness.store.storedIDs() == [subsetRecord.id])
       #expect(
         try !harness.metadata.hasFetched(
           table: TaggedReplicaTestRecord.tableName,
@@ -1159,18 +1216,14 @@ struct ElectricReplicaOwnerLifecycleTests {
   }
 
   @Test
-  func freshOnDemandStaticSimpleOwnerFullBootstrapsWhenPristineRevalidationErrors() async throws {
+  func freshOnDemandStaticSimpleOwnerUsesDemandedSubsetWhenPristineRevalidationErrors()
+    async throws
+  {
     let sessionController = TestSessionController()
     do {
-      let bootstrapRecord = TaggedReplicaTestRecord(id: "bootstrap", name: "Bootstrap")
       let subsetRecord = TaggedReplicaTestRecord(id: "today", name: "Today")
       let harness = ReplicaHarness<TaggedReplicaTestRecord>(
         responses: [
-          [
-            ElectricMessage.replicaRecord(
-              bootstrapRecord, offset: "offset-bootstrap", tags: ["shape"]),
-            ElectricMessage.replicaUpToDate(offset: "offset-bootstrap"),
-          ],
           [
             ElectricMessage.replicaRecord(
               subsetRecord,
@@ -1179,7 +1232,7 @@ struct ElectricReplicaOwnerLifecycleTests {
               isSubsetSnapshot: true
             ),
             ElectricMessage.replicaSubsetEnd(offset: "offset-today"),
-          ],
+          ]
         ],
         syncMode: .onDemand,
         isExactCursorCutoverEnabled: true,
@@ -1204,13 +1257,12 @@ struct ElectricReplicaOwnerLifecycleTests {
 
       #expect(subset.appliedRecords == [subsetRecord])
       let requests = await harness.http.capturedRequests()
-      #expect(requests.count == 2)
-      #expect(requests[0].offset == "-1")
-      #expect(requests[0].subset == nil)
-      #expect(requests[0].log == nil)
-      #expect(requests[1].offset == "offset-bootstrap")
-      #expect(requests[1].subset != nil)
-      #expect(harness.store.storedIDs() == [bootstrapRecord.id, subsetRecord.id])
+      #expect(requests.count == 1)
+      #expect(requests[0].offset == "now")
+      #expect(requests[0].subset != nil)
+      #expect(requests[0].log == .changesOnly)
+      #expect(!requests.contains { $0.subset == nil && $0.log == nil })
+      #expect(harness.store.storedIDs() == [subsetRecord.id])
       #expect(
         try !harness.metadata.hasFetched(
           table: TaggedReplicaTestRecord.tableName,
@@ -1415,25 +1467,17 @@ struct ElectricReplicaOwnerLifecycleTests {
   }
 
   @Test
-  func declaredSimpleTaggedOnDemandPreloadAndWriterRecoverFromOwnershipAdmissionError()
+  func declaredSimpleTaggedOnDemandPreloadRecoversThroughDemandedSubsetOnly()
     async throws
   {
     let sessionController = TestSessionController()
     let logger = RecordingLogProvider()
     do {
-      let bootstrapRecord = TaggedReplicaTestRecord(id: "bootstrap", name: "Bootstrap")
+      let staleRecord = TaggedReplicaTestRecord(id: "stale", name: "Stale")
       let subsetRecord = TaggedReplicaTestRecord(id: "subset", name: "Subset")
       let tailRecord = TaggedReplicaTestRecord(id: "tail", name: "Tail")
       let harness = ReplicaHarness<TaggedReplicaTestRecord>(
         responses: [
-          [
-            ElectricMessage.replicaRecord(
-              bootstrapRecord,
-              offset: "offset-bootstrap",
-              tags: ["shape"]
-            ),
-            ElectricMessage.replicaUpToDate(offset: "offset-bootstrap"),
-          ],
           [
             ElectricMessage.replicaRecord(
               subsetRecord,
@@ -1473,43 +1517,45 @@ struct ElectricReplicaOwnerLifecycleTests {
         ),
         transaction: nil
       )
+      harness.store.upsert(id: staleRecord.id, name: staleRecord.name)
+      harness.metadata.seedOwnedRow(
+        table: TaggedReplicaTestRecord.tableName,
+        rowKey: staleRecord.id
+      )
       let subsetPredicate = SQLExpression("id = 'subset'")
-      // This coverage belongs to the stale generation. The authoritative
-      // replacement must clear it atomically before the pending subset is
-      // evaluated, otherwise requestSnapshot cache-hits and skips the POST.
+      // This row and coverage belong to the stale generation. Recovery must
+      // replace them atomically with the demanded subset, without fetching the
+      // collection's unscoped history first.
       try await harness.client.markFetched(TaggedReplicaTestRecord.self, where: subsetPredicate)
       let snapshot = try #require(sessionController.captureAuthenticatedSession())
-      // This is the same `ensureSubset` entry point the subscription wrapper
-      // uses for preload. The injected metadata failure must not escape it.
-      let subset = try await harness.collection.ensureSubset(
+      _ = try await harness.collection.query(
         where: subsetPredicate,
         session: snapshot
       )
 
-      #expect(subset.appliedRecords == [subsetRecord])
       #expect(!replica.isTrackerContinuityUnavailable)
-      let bootstrapAndSubsetRequests = await harness.http.capturedRequests()
-      #expect(bootstrapAndSubsetRequests.count == 2)
-      #expect(bootstrapAndSubsetRequests[0].offset == "-1")
-      #expect(bootstrapAndSubsetRequests[0].subset == nil)
-      #expect(bootstrapAndSubsetRequests[0].log == nil)
-      #expect(bootstrapAndSubsetRequests[1].offset == "offset-bootstrap")
-      #expect(bootstrapAndSubsetRequests[1].subset != nil)
-      #expect(bootstrapAndSubsetRequests[1].log == .changesOnly)
+      #expect(harness.store.storedIDs() == [subsetRecord.id])
+      let recoveryRequests = await harness.http.capturedRequests()
+      #expect(recoveryRequests.count == 1)
+      #expect(recoveryRequests[0].offset == "now")
+      #expect(recoveryRequests[0].subset != nil)
+      #expect(recoveryRequests[0].log == .changesOnly)
+      #expect(!recoveryRequests.contains { $0.subset == nil && $0.log == nil })
 
       let token = harness.collection.keepSynced(session: snapshot)
       defer { token.cancel() }
       try await waitUntilTrueAsync { harness.store.storedIDs().contains(tailRecord.id) }
 
       let requests = await harness.http.capturedRequests()
-      #expect(requests.count >= 3)
-      #expect(requests[2].offset == "offset-subset")
-      #expect(requests[2].log == .changesOnly)
+      #expect(requests.count >= 2)
+      #expect(requests[1].offset == "offset-subset")
+      #expect(requests[1].log == .changesOnly)
+      #expect(!requests.contains { $0.subset == nil && $0.log == nil })
       #expect(
         logger.entries().contains(
           .init(
             level: .warning,
-            message: "electric_tracker_rebuild_admission_failed_full_bootstrap",
+            message: "electric_tracker_rebuild_admission_failed_subset_reset",
             metadata: [
               "table": TaggedReplicaTestRecord.tableName,
               "collection": TaggedReplicaTestRecord.collectionIdentifier,

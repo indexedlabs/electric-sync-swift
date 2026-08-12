@@ -18,7 +18,7 @@ Add the package in Xcode or to your `Package.swift`:
 dependencies: [
   .package(
     url: "https://github.com/indexedlabs/electric-sync-swift.git",
-    from: "0.1.6"
+    from: "0.1.7"
   )
 ]
 ```

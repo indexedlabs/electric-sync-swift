@@ -147,12 +147,11 @@ public struct SyncBatch<T: ElectricCollectionModel>: Sendable {
     public let encounteredTruncate: Bool
     public let missingRowKeys: [String]
     fileprivate let cursorOwnershipCollisionReports: [ElectricCursorOwnershipCollisionReport]
-    /// True when this apply invalidated the replica's resume state (stream
-    /// truncate or tracker-loss full bootstrap) and a snapshot must replace
-    /// existing rows atomically via `prepareTruncateSwap`. The owner normally
-    /// arms its pending swap from this flag; a known tracker-loss path may arm
-    /// it before issuing its forced full snapshot, while this remains the
-    /// defensive backstop for apply-discovered resets.
+    /// True when this apply invalidated the replica's resume state and a
+    /// snapshot must replace existing rows atomically via `prepareTruncateSwap`.
+    /// The owner normally arms its pending swap from this flag; a known
+    /// tracker-loss path may arm it before issuing its recovery snapshot, while
+    /// this remains the defensive backstop for apply-discovered resets.
     public var requiresReplacementSwap = false
     fileprivate var onTransactionCommitted: @Sendable () -> Void = {}
 
@@ -1319,8 +1318,9 @@ public actor ElectricSyncClientImpl {
   /// Determines whether this owner must replace its stream before it can use
   /// tagged protocol input. Declared-simple shapes can avoid that replacement
   /// only when their exact durable ownership state reconstructs the tracker.
-  /// A refused rebuild is not permission to resume: the owner must take the
-  /// established full-bootstrap recovery path instead.
+  /// A refused rebuild is not permission to resume: eager and DNF owners take
+  /// the full-bootstrap path, while statically-simple on-demand owners replace
+  /// their working set from the pending demanded subset.
   public func requiresFullBootstrapForTrackerContinuity<T: ElectricCollectionModel>(
     _: T.Type,
     identity: ElectricReplicaIdentity,
@@ -1380,11 +1380,20 @@ public actor ElectricSyncClientImpl {
     } catch {
       // Admission is an optimization. Any failed validation (resume, SQL,
       // malformed row key, or provider failure) is indistinguishable from a
-      // refused rebuild: make the owner replace its stream from a full
+      // refused rebuild. Statically-simple on-demand owners can replace their
+      // working set from the pending subset; other owners still need a full
       // bootstrap.
+      let usesDemandedSubsetReset = prefersDemandedSubsetResetForTrackerContinuity(
+        identity: identity,
+        syncMode: syncMode,
+        shapeTopology: shapeTopology
+      )
       logger.log(
         .warning,
-        message: "electric_tracker_rebuild_admission_failed_full_bootstrap",
+        message:
+          usesDemandedSubsetReset
+          ? "electric_tracker_rebuild_admission_failed_subset_reset"
+          : "electric_tracker_rebuild_admission_failed_full_bootstrap",
         metadata: [
           "table": T.tableName,
           "collection": identity.modelIdentifier,
@@ -1402,6 +1411,17 @@ public actor ElectricSyncClientImpl {
     }
     return semanticEpoch.isTaggedShapeCapabilityEnabled
       && effectiveShapeTopology == .staticallySimple
+  }
+
+  func prefersDemandedSubsetResetForTrackerContinuity(
+    identity: ElectricReplicaIdentity,
+    syncMode: ElectricCollectionSyncMode,
+    shapeTopology: ElectricShapeTopology
+  ) -> Bool {
+    guard syncMode == .onDemand else { return false }
+    let streamStateKey = persistedCursorKey(identity: identity, syncMode: syncMode)
+    return effectiveShapeTopology(shapeTopology, streamStateKey: streamStateKey)
+      == .staticallySimple
   }
 
   @discardableResult
@@ -1606,7 +1626,8 @@ public actor ElectricSyncClientImpl {
   ///
   /// Catch-up and subset messages are retained in protocol order. The owning
   /// transaction advances resume metadata only when the terminal subset
-  /// boundary commits.
+  /// boundary commits. `restartOnDemandFromNow` is reserved for callers that
+  /// have already armed an atomic replacement of the owner's stale generation.
   public func requestSnapshot<T>(
     _ type: T.Type,
     basePredicate: SQLExpression?,
@@ -1615,6 +1636,7 @@ public actor ElectricSyncClientImpl {
     syncMode: ElectricCollectionSyncMode,
     coverageSyncMode: ElectricCollectionSyncMode? = nil,
     ignorePersistedSyncState: Bool = false,
+    restartOnDemandFromNow: Bool = false,
     consultFetchCoverage: Bool = true,
     recordAsObservation: Bool = false,
     replicaIdentity: ElectricReplicaIdentity? = nil
@@ -1632,6 +1654,7 @@ public actor ElectricSyncClientImpl {
       "has_base_predicate": "\(basePredicate != nil)",
       "has_cursor": "\(descriptor.cursor != nil)",
       "ignore_persisted_sync_state": "\(ignorePersistedSyncState)",
+      "restart_on_demand_from_now": "\(restartOnDemandFromNow)",
       "thread.is_main": electricThreadIsMainValue(),
     ]
 
@@ -1645,8 +1668,14 @@ public actor ElectricSyncClientImpl {
         scope: basePredicate,
         requested: descriptor.predicate
       )
+      guard !restartOnDemandFromNow || syncMode == .onDemand else {
+        throw ElectricSyncError.fetchFailed(
+          "restartOnDemandFromNow requires an on-demand collection"
+        )
+      }
+
       let fetchPlan: FetchPlan? =
-        if consultFetchCoverage, cursor == nil {
+        if consultFetchCoverage, !restartOnDemandFromNow, cursor == nil {
           try await fetchTracker.computeMissing(
             table: T.tableName,
             requested: descriptor.predicate,
@@ -1747,21 +1776,26 @@ public actor ElectricSyncClientImpl {
         syncMode: syncMode
       )
       span.setAttribute(key: "resume.source", value: resumedSyncState.source.rawValue)
-      let admitsFreshOnDemandStaticSimple = try admitsFreshOnDemandStaticSimple(
-        T.self,
-        resumedState: resumedSyncState,
-        syncMode: syncMode,
-        shapeTopology: effectiveShapeTopology
-      )
+      let admitsFreshOnDemandStaticSimple =
+        if restartOnDemandFromNow {
+          false
+        } else {
+          try admitsFreshOnDemandStaticSimple(
+            T.self,
+            resumedState: resumedSyncState,
+            syncMode: syncMode,
+            shapeTopology: effectiveShapeTopology
+          )
+        }
       // `resumeSyncState` represents a fresh install with a synthetic `-1`
       // state so recovery paths can force a bootstrap. This direct on-demand
       // subset is not recovery, so begin at the normal `now` snapshot point.
       let syncState =
-        ignorePersistedSyncState || admitsFreshOnDemandStaticSimple
+        ignorePersistedSyncState || restartOnDemandFromNow || admitsFreshOnDemandStaticSimple
         ? nil
         : resumedSyncState.state
       let tracker = moveOutTracker(streamStateKey: streamStateKey)
-      if !ignorePersistedSyncState {
+      if !ignorePersistedSyncState, !restartOnDemandFromNow {
         _ = try rebuildSimpleTrackerIfAdmissible(
           T.self,
           identity: replicaIdentity,
@@ -1772,12 +1806,14 @@ public actor ElectricSyncClientImpl {
         )
       }
       guard
-        !requiresSemanticEpochReset(
-          syncState: resumedSyncState.persistedState,
-          tracker: tracker,
-          semanticEpoch: protocolSemanticEpoch
-        ),
+        restartOnDemandFromNow
+          || !requiresSemanticEpochReset(
+            syncState: resumedSyncState.persistedState,
+            tracker: tracker,
+            semanticEpoch: protocolSemanticEpoch
+          ),
         !resumedSyncState.hasPersistedFullBootstrap || ignorePersistedSyncState
+          || restartOnDemandFromNow
       else {
         throw ElectricSyncError.capabilitySemanticEpochTransitionDeferred
       }
@@ -1789,7 +1825,9 @@ public actor ElectricSyncClientImpl {
 
       let initialOffset = initialOffsetForStream(syncMode: syncMode)
       let requestOffset =
-        ignorePersistedSyncState ? "-1" : syncState?.offset ?? initialOffset
+        ignorePersistedSyncState
+        ? "-1"
+        : restartOnDemandFromNow ? "now" : syncState?.offset ?? initialOffset
       var requestHandle = syncState?.handle
 
       if requestOffset == "-1" {
