@@ -272,8 +272,10 @@ public final class ElectricShapeReplica<Model: ElectricCollectionModel>: @unchec
   /// True when this owner cannot prove process-local membership-tracker
   /// continuity for an incremental resume. Fresh processes, runtime-owner
   /// eviction, suspension, and cancellation all invalidate continuity; owners
-  /// whose model requires the tracker must then discard incremental resume and
-  /// full-bootstrap before going live again.
+  /// whose model requires the tracker must then replace their stale generation
+  /// before going live again. Statically-simple on-demand owners can establish
+  /// the replacement from their next demanded subset; other owners bootstrap
+  /// the full shape.
   public var isTrackerContinuityUnavailable: Bool {
     !trackerContinuity.isEstablished
   }
