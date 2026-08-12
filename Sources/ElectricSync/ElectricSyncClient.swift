@@ -1806,14 +1806,12 @@ public actor ElectricSyncClientImpl {
         )
       }
       guard
-        restartOnDemandFromNow
-          || !requiresSemanticEpochReset(
-            syncState: resumedSyncState.persistedState,
-            tracker: tracker,
-            semanticEpoch: protocolSemanticEpoch
-          ),
+        !requiresSemanticEpochReset(
+          syncState: resumedSyncState.persistedState,
+          tracker: tracker,
+          semanticEpoch: protocolSemanticEpoch
+        ),
         !resumedSyncState.hasPersistedFullBootstrap || ignorePersistedSyncState
-          || restartOnDemandFromNow
       else {
         throw ElectricSyncError.capabilitySemanticEpochTransitionDeferred
       }
