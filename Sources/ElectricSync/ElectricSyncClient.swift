@@ -1106,6 +1106,11 @@ public actor ElectricSyncClientImpl {
     case legacyAdopted = "legacy_adopted"
     case legacyExactMiss = "legacy_exact_miss"
     case legacyPreCutover = "legacy_pre_cutover"
+    /// Exact-disabled resume whose persisted state carries a compatible-mode
+    /// bridge attestation: the application atomically renamed the cursor, row
+    /// ownership, and tombstones from another mode's legacy key and recorded
+    /// the source mode on the state itself.
+    case legacyBridged = "legacy_bridged"
   }
 
   private struct ResumedSyncState {
@@ -1118,7 +1123,7 @@ public actor ElectricSyncClientImpl {
       switch source {
       case .fresh, .legacyExactMiss:
         nil
-      case .exact, .legacyAdopted, .legacyPreCutover:
+      case .exact, .legacyAdopted, .legacyPreCutover, .legacyBridged:
         state
       }
     }
@@ -1221,11 +1226,14 @@ public actor ElectricSyncClientImpl {
     case refused(reason: String)
   }
 
+  private static let bridgeCompatibleModes: Set<ElectricCollectionSyncMode> = [.eager, .progressive]
+
   private func rebuildSimpleTrackerIfAdmissible<T: ElectricCollectionModel>(
     _: T.Type,
     identity: ElectricReplicaIdentity,
     resumedState: ResumedSyncState,
     shapeTopology: ElectricShapeTopology,
+    syncMode: ElectricCollectionSyncMode,
     tracker: MoveOutTagTracker,
     semanticEpoch: ElectricProtocolSemanticEpoch
   ) throws -> SimpleTrackerRebuildAdmission {
@@ -1235,7 +1243,24 @@ public actor ElectricSyncClientImpl {
     guard shapeTopology == .staticallySimple else {
       return .refused(reason: "shape_topology_not_statically_simple")
     }
-    guard resumedState.source == .exact else {
+    // `.exact` carries continuity by construction. `.legacyBridged` carries it
+    // by application attestation: the cursor, row ownership, and tombstones
+    // were atomically renamed from a compatible mode's legacy key. The bridge
+    // is only defined between the full-log modes; onDemand starts a fresh
+    // changes_only tail instead and never rides a bridge.
+    let ownershipShapeIdentity: String
+    switch resumedState.source {
+    case .exact:
+      ownershipShapeIdentity = identity.persistedCursorKey
+    case .legacyBridged:
+      guard let bridgedFrom = resumedState.persistedState?.bridgedFromSyncMode,
+        Self.bridgeCompatibleModes.contains(bridgedFrom),
+        Self.bridgeCompatibleModes.contains(syncMode)
+      else {
+        return .refused(reason: "bridge_mode_pair_not_compatible")
+      }
+      ownershipShapeIdentity = identity.legacyPersistedCursorKey(syncMode: syncMode)
+    case .fresh, .legacyAdopted, .legacyExactMiss, .legacyPreCutover:
       return .refused(reason: "resume_source_not_exact")
     }
     guard resumedState.persistedState?.canResumeWithoutFullBootstrap == true else {
@@ -1250,7 +1275,7 @@ public actor ElectricSyncClientImpl {
     guard
       let tags = try metadataProvider.trackerRebuildOwnership(
         table: T.tableName,
-        shapeIdentity: identity.persistedCursorKey,
+        shapeIdentity: ownershipShapeIdentity,
         localTableOwnership: T.electricLocalTableOwnership,
         transaction: nil
       )
@@ -1359,6 +1384,7 @@ public actor ElectricSyncClientImpl {
         identity: identity,
         resumedState: resumedState,
         shapeTopology: effectiveShapeTopology,
+        syncMode: syncMode,
         tracker: tracker,
         semanticEpoch: semanticEpoch
       )
@@ -1801,6 +1827,7 @@ public actor ElectricSyncClientImpl {
           identity: replicaIdentity,
           resumedState: resumedSyncState,
           shapeTopology: effectiveShapeTopology,
+          syncMode: syncMode,
           tracker: tracker,
           semanticEpoch: protocolSemanticEpoch
         )
@@ -2197,6 +2224,7 @@ public actor ElectricSyncClientImpl {
           identity: replicaIdentity,
           resumedState: resumedSyncState,
           shapeTopology: effectiveShapeTopology,
+          syncMode: syncMode,
           tracker: tracker,
           semanticEpoch: protocolSemanticEpoch
         )
@@ -2387,6 +2415,7 @@ public actor ElectricSyncClientImpl {
         identity: replicaIdentity,
         resumedState: resumedSyncState,
         shapeTopology: effectiveShapeTopology,
+        syncMode: syncMode,
         tracker: tracker,
         semanticEpoch: connectSemanticEpoch
       )
@@ -2985,9 +3014,14 @@ public actor ElectricSyncClientImpl {
         collectionId: identity.legacyPersistedCursorKey(syncMode: syncMode),
         transaction: nil
       )
+      // A bridge attestation upgrades the classification: the state under this
+      // mode's key was atomically migrated from another compatible mode by the
+      // application, so the simple tracker rebuild may treat it like exact
+      // continuity for statically simple shapes.
+      let source: ResumeSource = state?.bridgedFromSyncMode != nil ? .legacyBridged : .legacyPreCutover
       return ResumedSyncState(
         state: state,
-        source: .legacyPreCutover,
+        source: source,
         rollbackStreamStateKeys: [],
         invalidationStreamStateKeys: []
       )
