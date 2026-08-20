@@ -1259,7 +1259,11 @@ public actor ElectricSyncClientImpl {
       else {
         return .refused(reason: "bridge_mode_pair_not_compatible")
       }
-      ownershipShapeIdentity = identity.legacyPersistedCursorKey(syncMode: syncMode)
+      // The application's bridge rekeys durable ownership to the EXACT
+      // validity key in the same transaction as the cursor rename — the DNF
+      // contract's rebuild escape hatch is defined under exact validity keys,
+      // so the bridged lookup uses the same key as the exact path.
+      ownershipShapeIdentity = identity.persistedCursorKey
     case .fresh, .legacyAdopted, .legacyExactMiss, .legacyPreCutover:
       return .refused(reason: "resume_source_not_exact")
     }
