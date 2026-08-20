@@ -132,6 +132,15 @@ public struct SyncState: Sendable {
   public let isUpToDate: Bool
   public let lastSyncedAt: Date?
   public let protocolSemanticEpoch: ElectricProtocolSemanticEpoch
+  /// Compatible-mode bridge attestation. Set by the application when it
+  /// atomically renames a legacy mode-keyed cursor (state, row ownership, and
+  /// tombstones in one transaction) to a new sync mode's key, recording the
+  /// mode the state was migrated FROM. Presence upgrades the exact-disabled
+  /// resume classification from pre-cutover to bridged, which the simple
+  /// tracker rebuild may admit for statically simple shapes on
+  /// eager <-> progressive transitions. Nil everywhere else; states persisted
+  /// before this field existed decode as nil and classify exactly as before.
+  public let bridgedFromSyncMode: ElectricCollectionSyncMode?
 
   public init(
     offset: String?,
@@ -139,7 +148,8 @@ public struct SyncState: Sendable {
     cursor: String?,
     isUpToDate: Bool,
     lastSyncedAt: Date?,
-    protocolSemanticEpoch: ElectricProtocolSemanticEpoch = .legacy
+    protocolSemanticEpoch: ElectricProtocolSemanticEpoch = .legacy,
+    bridgedFromSyncMode: ElectricCollectionSyncMode? = nil
   ) {
     self.offset = offset
     self.handle = handle
@@ -147,6 +157,7 @@ public struct SyncState: Sendable {
     self.isUpToDate = isUpToDate
     self.lastSyncedAt = lastSyncedAt
     self.protocolSemanticEpoch = protocolSemanticEpoch
+    self.bridgedFromSyncMode = bridgedFromSyncMode
   }
 }
 

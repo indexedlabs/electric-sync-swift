@@ -293,6 +293,166 @@ struct ElectricReplicaOwnerLifecycleTests {
     }
   }
 
+  // MARK: - Compatible-mode bridge admission
+
+  @Test
+  func bridgedEagerCursorResumesWithoutBootstrapWhenExactDisabled() async throws {
+    let sessionController = TestSessionController()
+    let snapshot = try #require(sessionController.captureAuthenticatedSession())
+    let policy = ElectricProtocolCapabilityPolicy.enabled
+    let legacyKey = ElectricReplicaIdentity(
+      modelType: ReplicaTestRecord.self,
+      modelIdentifier: ReplicaTestRecord.collectionIdentifier,
+      basePredicate: nil
+    ).legacyPersistedCursorKey(syncMode: .eager)
+    let harness = ReplicaHarness<ReplicaTestRecord>(
+      responses: [[ElectricMessage.replicaUpToDate(offset: "offset-after-bridge")]],
+      syncMode: .eager,
+      isExactCursorCutoverEnabled: false,
+      protocolCapabilityPolicy: policy,
+      trackerRebuildOwnership: [legacyKey: ["row-1", "row-2"]]
+    )
+    try harness.metadata.updateSyncState(
+      collectionId: legacyKey,
+      state: SyncState(
+        offset: "legacy-progressive-offset",
+        handle: "legacy-handle",
+        cursor: nil,
+        isUpToDate: true,
+        lastSyncedAt: Date(timeIntervalSince1970: 1_000),
+        protocolSemanticEpoch: policy.semanticEpoch(),
+        bridgedFromSyncMode: .progressive
+      ),
+      transaction: nil
+    )
+
+    let token = harness.collection.keepSynced(session: snapshot)
+    defer { token.cancel() }
+    try await waitUntilTrueAsync { await harness.http.requestCount() >= 1 }
+
+    let request = try #require(await harness.http.capturedRequests().first)
+    #expect(request.offset == "legacy-progressive-offset")
+    #expect(request.handle == "legacy-handle")
+  }
+
+  @Test
+  func bridgedCursorOnDNFTopologyStillRequiresFullBootstrap() async throws {
+    let sessionController = TestSessionController()
+    let snapshot = try #require(sessionController.captureAuthenticatedSession())
+    let policy = ElectricProtocolCapabilityPolicy.enabled
+    let legacyKey = ElectricReplicaIdentity(
+      modelType: ReplicaTestRecord.self,
+      modelIdentifier: ReplicaTestRecord.collectionIdentifier,
+      basePredicate: nil
+    ).legacyPersistedCursorKey(syncMode: .eager)
+    let harness = ReplicaHarness<ReplicaTestRecord>(
+      responses: [[ElectricMessage.replicaUpToDate(offset: "offset-bootstrap")]],
+      syncMode: .eager,
+      isExactCursorCutoverEnabled: false,
+      protocolCapabilityPolicy: policy,
+      shapeTopology: .dnf,
+      trackerRebuildOwnership: [legacyKey: ["row-1"]]
+    )
+    try harness.metadata.updateSyncState(
+      collectionId: legacyKey,
+      state: SyncState(
+        offset: "legacy-progressive-offset",
+        handle: "legacy-handle",
+        cursor: nil,
+        isUpToDate: true,
+        lastSyncedAt: Date(timeIntervalSince1970: 1_000),
+        protocolSemanticEpoch: policy.semanticEpoch(),
+        bridgedFromSyncMode: .progressive
+      ),
+      transaction: nil
+    )
+
+    let token = harness.collection.keepSynced(session: snapshot)
+    defer { token.cancel() }
+    try await waitUntilTrueAsync { await harness.http.requestCount() >= 1 }
+
+    let request = try #require(await harness.http.capturedRequests().first)
+    #expect(request.offset == "-1")
+  }
+
+  @Test
+  func unattestedLegacyCursorKeepsPreCutoverBootstrapBehavior() async throws {
+    let sessionController = TestSessionController()
+    let snapshot = try #require(sessionController.captureAuthenticatedSession())
+    let policy = ElectricProtocolCapabilityPolicy.enabled
+    let legacyKey = ElectricReplicaIdentity(
+      modelType: ReplicaTestRecord.self,
+      modelIdentifier: ReplicaTestRecord.collectionIdentifier,
+      basePredicate: nil
+    ).legacyPersistedCursorKey(syncMode: .eager)
+    let harness = ReplicaHarness<ReplicaTestRecord>(
+      responses: [[ElectricMessage.replicaUpToDate(offset: "offset-bootstrap")]],
+      syncMode: .eager,
+      isExactCursorCutoverEnabled: false,
+      protocolCapabilityPolicy: policy,
+      trackerRebuildOwnership: [legacyKey: ["row-1"]]
+    )
+    try harness.metadata.updateSyncState(
+      collectionId: legacyKey,
+      state: SyncState(
+        offset: "legacy-progressive-offset",
+        handle: "legacy-handle",
+        cursor: nil,
+        isUpToDate: true,
+        lastSyncedAt: Date(timeIntervalSince1970: 1_000),
+        protocolSemanticEpoch: policy.semanticEpoch()
+      ),
+      transaction: nil
+    )
+
+    let token = harness.collection.keepSynced(session: snapshot)
+    defer { token.cancel() }
+    try await waitUntilTrueAsync { await harness.http.requestCount() >= 1 }
+
+    let request = try #require(await harness.http.capturedRequests().first)
+    #expect(request.offset == "-1")
+  }
+
+  @Test
+  func bridgedCursorNeverAdmitsIntoOnDemand() async throws {
+    let sessionController = TestSessionController()
+    let snapshot = try #require(sessionController.captureAuthenticatedSession())
+    let policy = ElectricProtocolCapabilityPolicy.enabled
+    let legacyKey = ElectricReplicaIdentity(
+      modelType: ReplicaTestRecord.self,
+      modelIdentifier: ReplicaTestRecord.collectionIdentifier,
+      basePredicate: nil
+    ).legacyPersistedCursorKey(syncMode: .onDemand)
+    let harness = ReplicaHarness<ReplicaTestRecord>(
+      responses: [[ElectricMessage.replicaUpToDate(offset: "offset-tail")]],
+      syncMode: .onDemand,
+      isExactCursorCutoverEnabled: false,
+      protocolCapabilityPolicy: policy,
+      trackerRebuildOwnership: [legacyKey: ["row-1"]],
+      admitsFreshOnDemandPristineOwner: true
+    )
+    try harness.metadata.updateSyncState(
+      collectionId: legacyKey,
+      state: SyncState(
+        offset: "legacy-progressive-offset",
+        handle: "legacy-handle",
+        cursor: nil,
+        isUpToDate: true,
+        lastSyncedAt: Date(timeIntervalSince1970: 1_000),
+        protocolSemanticEpoch: policy.semanticEpoch(),
+        bridgedFromSyncMode: .progressive
+      ),
+      transaction: nil
+    )
+
+    let token = harness.collection.keepSynced(session: snapshot)
+    defer { token.cancel() }
+    try await waitUntilTrueAsync { await harness.http.requestCount() >= 1 }
+
+    let request = try #require(await harness.http.capturedRequests().first)
+    #expect(request.offset != "legacy-progressive-offset" || request.log == .changesOnly)
+  }
+
   // MARK: - Tracker continuity
 
   @Test
