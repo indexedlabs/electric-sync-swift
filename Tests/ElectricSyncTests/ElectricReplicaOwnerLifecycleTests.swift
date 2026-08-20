@@ -310,7 +310,13 @@ struct ElectricReplicaOwnerLifecycleTests {
       syncMode: .eager,
       isExactCursorCutoverEnabled: false,
       protocolCapabilityPolicy: policy,
-      trackerRebuildOwnership: [legacyKey: ["row-1", "row-2"]]
+      trackerRebuildOwnership: [
+        ElectricReplicaIdentity(
+          modelType: ReplicaTestRecord.self,
+          modelIdentifier: ReplicaTestRecord.collectionIdentifier,
+          basePredicate: nil
+        ).persistedCursorKey: ["row-1", "row-2"]
+      ]
     )
     try harness.metadata.updateSyncState(
       collectionId: legacyKey,
