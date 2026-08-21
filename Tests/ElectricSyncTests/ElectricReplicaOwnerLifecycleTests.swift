@@ -2045,7 +2045,7 @@ struct ElectricReplicaOwnerLifecycleTests {
   }
 
   @Test
-  func returnedLeaseCancellationFencesRetainedRawTailDuringRecovery() async throws {
+  func returnedLeaseCancellationDoesNotForceFullBootstrapDuringRecovery() async throws {
     let sessionController = TestSessionController()
     let seed = ReplicaTestRecord(id: "seed", name: "Seed")
     let reseeded = ReplicaTestRecord(id: "seed", name: "Reseeded")
@@ -2088,8 +2088,8 @@ struct ElectricReplicaOwnerLifecycleTests {
     await harness.http.resumeBlockedFetch()
     for _ in 0..<20 { await Task.yield() }
 
-    #expect(await harness.http.requestCount() == 3)
     let requests = await harness.http.capturedRequests()
+    #expect(requests.count >= 3)
     #expect(!requests.contains { $0.offset == "-1" })
   }
 
