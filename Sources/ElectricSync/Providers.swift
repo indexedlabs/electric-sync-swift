@@ -84,6 +84,10 @@ public protocol MetadataProvider: Sendable {
     shapeIdentity: String,
     transaction: Any?
   ) throws -> [String]
+  /// Clears every ownership/tag/deferred-delete record for an exclusive local
+  /// table. This must participate in the caller's transaction with the table
+  /// truncate and cursor/coverage replacement.
+  func clearExclusiveWorkingSetOwnership(table: String, transaction: Any?) throws
   func removeAllRowOwnership(table: String, rowKey: String, transaction: Any?) throws
   func getRowOwnershipTags(
     table: String,
@@ -231,6 +235,14 @@ extension MetadataProvider {
     transaction _: Any?
   ) throws -> [String] {
     []
+  }
+
+  public func clearExclusiveWorkingSetOwnership(
+    table _: String,
+    transaction _: Any?
+  ) throws {
+    // Opt-in working-set recovery is unsafe without this atomic provider hook.
+    throw ElectricSyncError.fetchFailed("exclusive working-set reset is unsupported")
   }
 
   public func removeAllRowOwnership(

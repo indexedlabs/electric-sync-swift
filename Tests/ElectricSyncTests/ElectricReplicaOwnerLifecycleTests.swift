@@ -1739,6 +1739,75 @@ struct ElectricReplicaOwnerLifecycleTests {
   }
 
   @Test
+  func optedInExclusiveDNFOwnerReplacesWorkingSetFromSubsetBeforeTail() async throws {
+    let sessionController = TestSessionController()
+    do {
+      let staleRecord = ReplicaTestRecord(id: "stale", name: "Stale")
+      let seedRecord = ReplicaTestRecord(id: "seed", name: "Seed")
+      let tailRecord = ReplicaTestRecord(id: "tail", name: "Tail")
+      let harness = ReplicaHarness<ReplicaTestRecord>(
+        responses: [
+          [
+            ElectricMessage.replicaRecord(
+              seedRecord,
+              offset: "offset-seed",
+              tags: ["shape"],
+              isSubsetSnapshot: true
+            ),
+            ElectricMessage.replicaSubsetEnd(offset: "offset-seed"),
+          ],
+          [
+            ElectricMessage.replicaRecord(tailRecord, offset: "offset-tail", tags: ["shape"]),
+            ElectricMessage.replicaUpToDate(offset: "offset-tail"),
+          ],
+        ],
+        syncMode: .onDemand,
+        isExactCursorCutoverEnabled: true,
+        protocolCapabilityPolicy: .enabled,
+        shapeTopology: .dnf,
+        trackerContinuityRecoveryPolicy: .replaceExclusiveWorkingSetFromDemandedSubsets
+      )
+      let replica = harness.collection.replica
+      try harness.metadata.updateSyncState(
+        collectionId: replica.identity.persistedCursorKey,
+        state: SyncState(
+          offset: "offset-stale",
+          handle: "handle-stale",
+          cursor: "cursor-stale",
+          isUpToDate: true,
+          lastSyncedAt: Date(),
+          protocolSemanticEpoch: .taggedShape1_7_7
+        ),
+        transaction: nil
+      )
+      harness.store.upsert(id: staleRecord.id, name: staleRecord.name)
+      harness.metadata.seedOwnedRow(table: ReplicaTestRecord.tableName, rowKey: staleRecord.id)
+      let session = try #require(sessionController.captureAuthenticatedSession())
+
+      _ = try await harness.collection.ensureSubset(
+        where: SQLExpression(predicate: .equals(field: "id", value: .string("seed"))),
+        session: session
+      )
+
+      #expect(!replica.isTrackerContinuityUnavailable)
+      #expect(harness.store.storedIDs() == [seedRecord.id])
+      let requests = await harness.http.capturedRequests()
+      #expect(requests.count == 1)
+      #expect(requests[0].offset == "now")
+      #expect(requests[0].subset?.whereClause == "id = $1")
+      #expect(requests[0].log == .changesOnly)
+      #expect(!requests.contains { $0.offset == "-1" && $0.subset == nil })
+
+      let token = harness.collection.keepSynced(session: session)
+      defer { token.cancel() }
+      try await waitUntilTrueAsync { harness.store.storedIDs().contains(tailRecord.id) }
+      let tailRequest = try #require((await harness.http.capturedRequests()).dropFirst().first)
+      #expect(tailRequest.offset == "offset-seed")
+      #expect(tailRequest.log == .changesOnly)
+    }
+  }
+
+  @Test
   func semanticEpochTransitionStillFullBootstrapsBeforeOnDemandSubset() async throws {
     let sessionController = TestSessionController()
     do {
@@ -2481,6 +2550,7 @@ private final class ReplicaHarness<Model: ElectricCollectionModel>: @unchecked S
     // scenarios must opt in explicitly so the fixture cannot accidentally
     // assert an incremental-resume contract for DNF state.
     shapeTopology: ElectricShapeTopology = .staticallySimple,
+    trackerContinuityRecoveryPolicy: ElectricTrackerContinuityRecoveryPolicy = .fullBootstrap,
     trackerRebuildAdmissionError: Bool = false,
     trackerRebuildOwnership: [String: [String]]? = nil,
     admitsFreshOnDemandPristineOwner: Bool = false,
@@ -2519,7 +2589,8 @@ private final class ReplicaHarness<Model: ElectricCollectionModel>: @unchecked S
     let configuration = ElectricCollectionConfiguration(
       modelType: Model.self,
       syncMode: syncMode,
-      shapeTopology: shapeTopology
+      shapeTopology: shapeTopology,
+      trackerContinuityRecoveryPolicy: trackerContinuityRecoveryPolicy
     )
     let store = self.store
     let replica = ElectricShapeReplica<Model>(
@@ -3108,6 +3179,12 @@ private final class ReplicaInMemoryMetadataProvider: MetadataProvider, @unchecke
     lock.withLock {
       defer { ownedRowKeys[table] = nil }
       return Array(ownedRowKeys[table] ?? []).sorted()
+    }
+  }
+
+  func clearExclusiveWorkingSetOwnership(table: String, transaction _: Any?) throws {
+    lock.withLock {
+      ownedRowKeys[table] = nil
     }
   }
 

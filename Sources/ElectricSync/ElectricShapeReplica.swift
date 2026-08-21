@@ -205,6 +205,8 @@ public final class ElectricShapeReplica<Model: ElectricCollectionModel>: @unchec
   private let workGate = ElectricReplicaWorkGate()
   private let replacementBufferingCount = ElectricReplicaAtomicCounter()
   private let trackerContinuity = ElectricReplicaTrackerContinuity()
+  private let workingSetTailReadiness = ElectricReplicaWorkingSetTailReadiness()
+  private let activeDemandLeases = ElectricReplicaDemandLeases()
   private let progressiveInitialBuffer: ElectricProgressiveInitialBuffer
 
   public init(
@@ -252,9 +254,11 @@ public final class ElectricShapeReplica<Model: ElectricCollectionModel>: @unchec
       diagnostics: client.cursorOwnershipDiagnostics
     )
     let trackerContinuity = self.trackerContinuity
+    let workingSetTailReadiness = self.workingSetTailReadiness
     let progressiveInitialBuffer = self.progressiveInitialBuffer
     self.streamController.onRuntimeOwnerEviction = {
       trackerContinuity.markLost()
+      workingSetTailReadiness.failRecovery()
       progressiveInitialBuffer.restart()
     }
   }
@@ -283,6 +287,42 @@ public final class ElectricShapeReplica<Model: ElectricCollectionModel>: @unchec
   func markTrackerContinuityEstablished() {
     trackerContinuity.markEstablished()
   }
+
+  func beginWorkingSetRecovery() {
+    workingSetTailReadiness.beginRecovery()
+  }
+
+  func completeWorkingSetRecovery() {
+    workingSetTailReadiness.completeRecovery()
+  }
+
+  func failWorkingSetRecovery() {
+    trackerContinuity.markLost()
+    workingSetTailReadiness.failRecovery()
+  }
+
+  var isWorkingSetTailReady: Bool { workingSetTailReadiness.isReady }
+
+  func waitForWorkingSetTailReadiness() async throws {
+    try workGate.checkAcceptingWork()
+    try Task.checkCancellation()
+    await workingSetTailReadiness.waitUntilReady()
+    try workGate.checkAcceptingWork()
+    try Task.checkCancellation()
+  }
+
+  func registerActiveDemand(_ descriptor: QueryDescriptor) -> UUID {
+    activeDemandLeases.register(descriptor)
+  }
+
+  func releaseActiveDemand(_ id: UUID) {
+    activeDemandLeases.release(id)
+  }
+
+  func activeDemandDescriptors(prioritizing first: QueryDescriptor? = nil) -> [QueryDescriptor] {
+    activeDemandLeases.descriptors(prioritizing: first)
+  }
+
 
   func noteReplacementBuffering(_ isBuffering: Bool) {
     if isBuffering {
@@ -432,6 +472,7 @@ public final class ElectricShapeReplica<Model: ElectricCollectionModel>: @unchec
   public func cancel() {
     workGate.close()
     trackerContinuity.markLost()
+    workingSetTailReadiness.failRecovery()
     progressiveInitialBuffer.finish()
     streamController.cancelAll()
   }
@@ -439,12 +480,14 @@ public final class ElectricShapeReplica<Model: ElectricCollectionModel>: @unchec
   public func closeWorkGate() {
     workGate.close()
     trackerContinuity.markLost()
+    workingSetTailReadiness.failRecovery()
     progressiveInitialBuffer.finish()
   }
 
   public func cancelAndWait() async {
     workGate.close()
     trackerContinuity.markLost()
+    workingSetTailReadiness.failRecovery()
     progressiveInitialBuffer.finish()
     async let streamCancellation: Void = streamController.cancelAllAndWait()
     async let queryCancellation: Void = coordinator.cancelAllAndWait()
@@ -458,6 +501,69 @@ public final class ElectricShapeReplica<Model: ElectricCollectionModel>: @unchec
 
   var isAcceptingWork: Bool {
     workGate.isAcceptingWork
+  }
+}
+
+private final class ElectricReplicaWorkingSetTailReadiness: @unchecked Sendable {
+  private let lock = NSLock()
+  private var ready = false
+  private var waiters: [CheckedContinuation<Void, Never>] = []
+
+  var isReady: Bool { lock.withLock { ready } }
+
+  func beginRecovery() { lock.withLock { ready = false } }
+  func completeRecovery() {
+    let waiters = lock.withLock { () -> [CheckedContinuation<Void, Never>] in
+      ready = true
+      defer { self.waiters.removeAll() }
+      return self.waiters
+    }
+    for waiter in waiters { waiter.resume() }
+  }
+  func failRecovery() {
+    let waiters = lock.withLock { () -> [CheckedContinuation<Void, Never>] in
+      ready = false
+      defer { self.waiters.removeAll() }
+      return self.waiters
+    }
+    for waiter in waiters { waiter.resume() }
+  }
+  func waitUntilReady() async {
+    guard !isReady else { return }
+    await withCheckedContinuation { continuation in
+      let resumeNow = lock.withLock {
+        guard !ready else { return true }
+        waiters.append(continuation)
+        return false
+      }
+      if resumeNow { continuation.resume() }
+    }
+  }
+}
+
+private final class ElectricReplicaDemandLeases: @unchecked Sendable {
+  private let lock = NSLock()
+  private var values: [UUID: QueryDescriptor] = [:]
+  func register(_ descriptor: QueryDescriptor) -> UUID {
+    let id = UUID()
+    lock.withLock { values[id] = descriptor }
+    return id
+  }
+  func release(_ id: UUID) { _ = lock.withLock { values.removeValue(forKey: id) } }
+  func descriptors(prioritizing first: QueryDescriptor?) -> [QueryDescriptor] {
+    lock.withLock {
+      let all = Set(values.values)
+      guard let first else { return all.sorted { $0.rawSortKey < $1.rawSortKey } }
+      return [first] + all.subtracting([first]).sorted { $0.rawSortKey < $1.rawSortKey }
+    }
+  }
+}
+
+private extension QueryDescriptor {
+  var rawSortKey: String {
+    let predicateValue = predicate?.rawValue ?? ""
+    let limitValue = limit.map(String.init) ?? ""
+    return predicateValue + "|" + String(describing: orderBy) + "|" + limitValue
   }
 }
 

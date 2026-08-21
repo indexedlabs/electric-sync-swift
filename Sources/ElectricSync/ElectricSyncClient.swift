@@ -71,6 +71,7 @@ public struct SyncBatch<T: ElectricCollectionModel>: Sendable {
   private let shapeTopology: ElectricShapeTopology
   private let shapeTopologyLatch: ElectricShapeTopologyLatch?
   private let protocolInputMessages: [ElectricMessage]
+  private let replacesExclusiveWorkingSet: Bool
 
   fileprivate init(
     collectionIdentifier: String,
@@ -102,7 +103,8 @@ public struct SyncBatch<T: ElectricCollectionModel>: Sendable {
     requiresSemanticEpochReset: Bool = false,
     shapeTopology: ElectricShapeTopology = .dnf,
     shapeTopologyLatch: ElectricShapeTopologyLatch? = nil,
-    protocolInputMessages: [ElectricMessage]? = nil
+    protocolInputMessages: [ElectricMessage]? = nil,
+    replacesExclusiveWorkingSet: Bool = false
   ) {
     self.collectionIdentifier = collectionIdentifier
     self.streamStateKey = streamStateKey
@@ -139,6 +141,7 @@ public struct SyncBatch<T: ElectricCollectionModel>: Sendable {
     self.shapeTopology = shapeTopology
     self.shapeTopologyLatch = shapeTopologyLatch
     self.protocolInputMessages = protocolInputMessages ?? messages
+    self.replacesExclusiveWorkingSet = replacesExclusiveWorkingSet
   }
 
   public struct Output: Sendable {
@@ -226,7 +229,8 @@ public struct SyncBatch<T: ElectricCollectionModel>: Sendable {
       requiresSemanticEpochReset: requiresSemanticEpochReset,
       shapeTopology: shapeTopology,
       shapeTopologyLatch: shapeTopologyLatch,
-      protocolInputMessages: protocolInputMessages
+      protocolInputMessages: protocolInputMessages,
+      replacesExclusiveWorkingSet: replacesExclusiveWorkingSet
     )
   }
 
@@ -941,6 +945,21 @@ public struct SyncBatch<T: ElectricCollectionModel>: Sendable {
     } else {
       try metadataProvider.clearMetadata(table: T.tableName, transaction: transactionContext)
     }
+    if replacesExclusiveWorkingSet {
+      guard metadataProvider.supportsDurableRowOwnership else {
+        throw ElectricSyncError.fetchFailed("exclusive working-set reset requires durable ownership")
+      }
+      try metadataProvider.clearExclusiveWorkingSetOwnership(
+        table: T.tableName,
+        transaction: transactionContext
+      )
+      try T.truncate(transaction: transactionContext)
+      return TruncateSwapPreparation(
+        unownedRowCount: 0,
+        deletedRowCount: 0,
+        usedTableTruncate: true
+      )
+    }
     guard metadataProvider.supportsDurableRowOwnership else {
       try T.truncate(transaction: transactionContext)
       return TruncateSwapPreparation(
@@ -1354,7 +1373,8 @@ public actor ElectricSyncClientImpl {
     _: T.Type,
     identity: ElectricReplicaIdentity,
     syncMode: ElectricCollectionSyncMode,
-    shapeTopology: ElectricShapeTopology
+    shapeTopology: ElectricShapeTopology,
+    recoveryPolicy: ElectricTrackerContinuityRecoveryPolicy = .fullBootstrap
   ) throws -> Bool {
     let semanticEpoch = protocolCapabilityPolicy.semanticEpoch()
     let streamStateKey = persistedCursorKey(identity: identity, syncMode: syncMode)
@@ -1414,9 +1434,11 @@ public actor ElectricSyncClientImpl {
       // working set from the pending subset; other owners still need a full
       // bootstrap.
       let usesDemandedSubsetReset = prefersDemandedSubsetResetForTrackerContinuity(
+        T.self,
         identity: identity,
         syncMode: syncMode,
-        shapeTopology: shapeTopology
+        shapeTopology: shapeTopology,
+        recoveryPolicy: recoveryPolicy
       )
       logger.log(
         .warning,
@@ -1443,15 +1465,39 @@ public actor ElectricSyncClientImpl {
       && effectiveShapeTopology == .staticallySimple
   }
 
-  func prefersDemandedSubsetResetForTrackerContinuity(
+  func prefersDemandedSubsetResetForTrackerContinuity<T: ElectricCollectionModel>(
+    _: T.Type,
     identity: ElectricReplicaIdentity,
     syncMode: ElectricCollectionSyncMode,
-    shapeTopology: ElectricShapeTopology
+    shapeTopology: ElectricShapeTopology,
+    recoveryPolicy: ElectricTrackerContinuityRecoveryPolicy = .fullBootstrap
   ) -> Bool {
     guard syncMode == .onDemand else { return false }
     let streamStateKey = persistedCursorKey(identity: identity, syncMode: syncMode)
-    return effectiveShapeTopology(shapeTopology, streamStateKey: streamStateKey)
-      == .staticallySimple
+    let effectiveTopology = effectiveShapeTopology(shapeTopology, streamStateKey: streamStateKey)
+    if effectiveTopology == .staticallySimple { return true }
+    return recoveryPolicy == .replaceExclusiveWorkingSetFromDemandedSubsets
+      && effectiveTopology == .dnf
+      && T.electricLocalTableOwnership == .exclusive
+      && T.moveOutTombstoneTimeToLive == nil
+      && metadataProvider.supportsDurableRowOwnership
+  }
+
+  func usesConfiguredOnDemandWorkingSetReset<T: ElectricCollectionModel>(
+    _: T.Type,
+    identity: ElectricReplicaIdentity,
+    syncMode: ElectricCollectionSyncMode,
+    shapeTopology: ElectricShapeTopology,
+    recoveryPolicy: ElectricTrackerContinuityRecoveryPolicy
+  ) -> Bool {
+    guard recoveryPolicy == .replaceExclusiveWorkingSetFromDemandedSubsets,
+      syncMode == .onDemand,
+      T.electricLocalTableOwnership == .exclusive,
+      T.moveOutTombstoneTimeToLive == nil,
+      metadataProvider.supportsDurableRowOwnership
+    else { return false }
+    let streamStateKey = persistedCursorKey(identity: identity, syncMode: syncMode)
+    return effectiveShapeTopology(shapeTopology, streamStateKey: streamStateKey) == .dnf
   }
 
   @discardableResult
@@ -1667,6 +1713,7 @@ public actor ElectricSyncClientImpl {
     coverageSyncMode: ElectricCollectionSyncMode? = nil,
     ignorePersistedSyncState: Bool = false,
     restartOnDemandFromNow: Bool = false,
+    replacesExclusiveWorkingSet: Bool = false,
     consultFetchCoverage: Bool = true,
     recordAsObservation: Bool = false,
     replicaIdentity: ElectricReplicaIdentity? = nil
@@ -1701,6 +1748,11 @@ public actor ElectricSyncClientImpl {
       guard !restartOnDemandFromNow || syncMode == .onDemand else {
         throw ElectricSyncError.fetchFailed(
           "restartOnDemandFromNow requires an on-demand collection"
+        )
+      }
+      guard !replacesExclusiveWorkingSet || restartOnDemandFromNow else {
+        throw ElectricSyncError.fetchFailed(
+          "exclusive working-set reset requires restartOnDemandFromNow"
         )
       }
 
@@ -1743,6 +1795,11 @@ public actor ElectricSyncClientImpl {
         shapeTopology,
         streamStateKey: streamStateKey
       )
+      if restartOnDemandFromNow {
+        // A replacement snapshot must fold its DNF fields into a new process
+        // tracker. The old generation is intentionally not resumable.
+        moveOutTrackers[streamStateKey] = makeMoveOutTracker()
+      }
 
       let fetchDescriptor: QueryDescriptor =
         if descriptor.cursor != nil {
@@ -1969,7 +2026,8 @@ public actor ElectricSyncClientImpl {
         protocolSemanticEpoch: protocolSemanticEpoch,
         runtimeProvider: runtimeProvider,
         shapeTopology: effectiveShapeTopology,
-        shapeTopologyLatch: shapeTopologyLatch
+        shapeTopologyLatch: shapeTopologyLatch,
+        replacesExclusiveWorkingSet: replacesExclusiveWorkingSet
       )
     }
   }
