@@ -206,6 +206,7 @@ public final class ElectricShapeReplica<Model: ElectricCollectionModel>: @unchec
   private let replacementBufferingCount = ElectricReplicaAtomicCounter()
   private let trackerContinuity = ElectricReplicaTrackerContinuity()
   private let workingSetRecovery = ElectricReplicaWorkingSetRecoveryCoordinator()
+  private let demandTailFence = ElectricReplicaDemandTailFence()
   private let progressiveInitialBuffer: ElectricProgressiveInitialBuffer
 
   public init(
@@ -252,14 +253,12 @@ public final class ElectricShapeReplica<Model: ElectricCollectionModel>: @unchec
       runtimeProvider: client.runtimeProvider,
       diagnostics: client.cursorOwnershipDiagnostics
     )
-    let identity = self.identity
     let trackerContinuity = self.trackerContinuity
     let workingSetRecovery = self.workingSetRecovery
     let progressiveInitialBuffer = self.progressiveInitialBuffer
     self.streamController.onRuntimeOwnerEviction = {
       let generation = trackerContinuity.markLost()
       Task {
-        await client.invalidateProcessLocalTracker(identity: identity, syncMode: syncMode)
         await workingSetRecovery.markLost(generation: generation)
       }
       progressiveInitialBuffer.restart()
@@ -302,8 +301,36 @@ public final class ElectricShapeReplica<Model: ElectricCollectionModel>: @unchec
 
   func invalidateWorkingSetTracker() async {
     let generation = trackerContinuity.markLost()
-    await client.invalidateProcessLocalTracker(identity: identity, syncMode: .onDemand)
     await workingSetRecovery.markLost(generation: generation)
+  }
+
+  /// Reset the process-local DNF tracker only after an elected recovery epoch
+  /// has proved it is still current. Runtime-owner eviction deliberately does
+  /// not schedule an unfenced reset: a delayed old eviction must never erase a
+  /// newer seed's membership state.
+  func prepareWorkingSetRecoverySeed(epoch: UInt64, lossGeneration: UInt64) async -> Bool {
+    guard trackerContinuity.currentGeneration == lossGeneration,
+      await workingSetRecovery.isCurrent(epoch: epoch, lossGeneration: lossGeneration)
+    else {
+      return false
+    }
+    let shouldResetTracker = await workingSetRecovery.claimTrackerReset(
+      epoch: epoch,
+      lossGeneration: lossGeneration
+    )
+    guard trackerContinuity.currentGeneration == lossGeneration,
+      await workingSetRecovery.isCurrent(epoch: epoch, lossGeneration: lossGeneration)
+    else {
+      return false
+    }
+    if shouldResetTracker {
+      await client.invalidateProcessLocalTracker(identity: identity, syncMode: .onDemand)
+    }
+    let isCurrent = await workingSetRecovery.isCurrent(
+      epoch: epoch,
+      lossGeneration: lossGeneration
+    )
+    return trackerContinuity.currentGeneration == lossGeneration && isCurrent
   }
 
   var isWorkingSetTailRunnable: Bool {
@@ -319,11 +346,38 @@ public final class ElectricShapeReplica<Model: ElectricCollectionModel>: @unchec
   }
 
   func registerActiveDemand(_ descriptor: QueryDescriptor) async -> UUID {
-    await workingSetRecovery.register(descriptor)
+    let id = UUID()
+    demandTailFence.insert(id)
+    await workingSetRecovery.register(id, descriptor)
+    return id
   }
 
   func releaseActiveDemand(_ id: UUID) {
+    // Lease cancellation/deinit is synchronous. Fence tail admission before
+    // handing the revision mutation to the recovery actor so a raw retained
+    // stream cannot issue another request after the last demand disappears.
+    demandTailFence.remove(id)
     Task { await workingSetRecovery.release(id) }
+  }
+
+  var hasSynchronousActiveDemand: Bool { demandTailFence.hasDemands }
+
+  /// Captures the zero-demand generation immediately before a live transport is
+  /// opened.  A lease release invalidates that admission synchronously, so a
+  /// result that wins the transport race is discarded rather than publishing a
+  /// tail batch after the final demand has gone away.
+  func admitWorkingSetTailRequest() -> ElectricReplicaDemandTailFence.Admission? {
+    demandTailFence.admitTailRequest()
+  }
+
+  func isWorkingSetTailRequestCurrent(_ admission: ElectricReplicaDemandTailFence.Admission)
+    -> Bool
+  {
+    demandTailFence.isCurrent(admission)
+  }
+
+  func waitForSynchronousActiveDemand() async throws {
+    try await demandTailFence.waitUntilDemanded()
   }
 
   func startWorkingSetRecoveryIfNeeded() async -> (epoch: UInt64, lossGeneration: UInt64)? {
@@ -343,7 +397,7 @@ public final class ElectricShapeReplica<Model: ElectricCollectionModel>: @unchec
     revision: UInt64,
     epoch: UInt64,
     lossGeneration: UInt64
-  ) async -> Bool {
+  ) async -> ElectricWorkingSetRecoveryCompletion {
     await workingSetRecovery.completeIfStable(
       revision: revision,
       epoch: epoch,
@@ -549,6 +603,12 @@ public final class ElectricShapeReplica<Model: ElectricCollectionModel>: @unchec
 /// tail from a stale inventory. This actor also makes the parked-tail wait
 /// cancellable: cancelling a stream token cannot strand an activation that is
 /// about to seed it.
+enum ElectricWorkingSetRecoveryCompletion: Sendable, Equatable {
+  case completed
+  case inventoryChanged
+  case staleGeneration
+}
+
 private actor ElectricReplicaWorkingSetRecoveryCoordinator {
   private var values: [UUID: QueryDescriptor] = [:]
   private var revision: UInt64 = 0
@@ -557,6 +617,7 @@ private actor ElectricReplicaWorkingSetRecoveryCoordinator {
   private var recoveryEpoch: UInt64 = 0
   private var knownLossGeneration: UInt64 = 0
   private var recoveryLossGeneration: UInt64 = 0
+  private var trackerResetEpoch: UInt64?
   private var waiters: [UUID: CheckedContinuation<Void, Error>] = [:]
 
   var isTailRunnable: Bool { ready && !values.isEmpty }
@@ -566,12 +627,10 @@ private actor ElectricReplicaWorkingSetRecoveryCoordinator {
     recovering && recoveryEpoch == epoch && recoveryLossGeneration == lossGeneration
   }
 
-  func register(_ descriptor: QueryDescriptor) -> UUID {
-    let id = UUID()
+  func register(_ id: UUID, _ descriptor: QueryDescriptor) {
     values[id] = descriptor
     revision &+= 1
     resumeTailWaitersIfRunnable()
-    return id
   }
 
   func release(_ id: UUID) {
@@ -598,6 +657,7 @@ private actor ElectricReplicaWorkingSetRecoveryCoordinator {
     recovering = true
     recoveryEpoch &+= 1
     recoveryLossGeneration = lossGeneration
+    trackerResetEpoch = nil
     return (recoveryEpoch, lossGeneration)
   }
 
@@ -612,6 +672,15 @@ private actor ElectricReplicaWorkingSetRecoveryCoordinator {
     return (revision, descriptors)
   }
 
+  /// The first serial seed in an epoch owns the in-place DNF tracker reset.
+  /// Later subset descriptors reuse the resulting tracker state.
+  func claimTrackerReset(epoch: UInt64, lossGeneration: UInt64) -> Bool {
+    guard isCurrent(epoch: epoch, lossGeneration: lossGeneration) else { return false }
+    if trackerResetEpoch == epoch { return false }
+    trackerResetEpoch = epoch
+    return true
+  }
+
   /// Completes only the exact inventory that was seeded. A changed revision
   /// stays parked and tells the leader to take another serial snapshot.
   func completeIfStable(
@@ -619,13 +688,13 @@ private actor ElectricReplicaWorkingSetRecoveryCoordinator {
     epoch expectedEpoch: UInt64,
     lossGeneration expectedLossGeneration: UInt64,
     establishTracker: @Sendable () -> Bool
-  ) -> Bool {
+  ) -> ElectricWorkingSetRecoveryCompletion {
     guard recovering,
       recoveryEpoch == expectedEpoch,
       recoveryLossGeneration == expectedLossGeneration,
-      knownLossGeneration == expectedLossGeneration,
-      revision == expectedRevision
-    else { return false }
+      knownLossGeneration == expectedLossGeneration
+    else { return .staleGeneration }
+    guard revision == expectedRevision else { return .inventoryChanged }
     guard establishTracker() else {
       // A synchronous eviction can advance the tracker generation just before
       // its actor hop arrives. Never advertise this stale seed as runnable.
@@ -633,16 +702,17 @@ private actor ElectricReplicaWorkingSetRecoveryCoordinator {
       recovering = false
       ready = false
       retryWaiters()
-      return false
+      return .staleGeneration
     }
     recovering = false
+    trackerResetEpoch = nil
     // Continuity is independent of demand liveness. A lease can disappear
     // after its serial seed commits; keep this generation established so a
     // later lease performs its ordinary subset, while the tail remains parked
     // because `isTailRunnable` also requires a non-empty inventory.
     ready = true
     resumeTailWaitersIfRunnable()
-    return true
+    return .completed
   }
 
   func failIfCurrent(
@@ -653,6 +723,7 @@ private actor ElectricReplicaWorkingSetRecoveryCoordinator {
     let lossGeneration = markTrackerLost()
     knownLossGeneration = max(knownLossGeneration, lossGeneration)
     recovering = false
+    trackerResetEpoch = nil
     ready = false
     failWaiters()
   }
@@ -663,6 +734,7 @@ private actor ElectricReplicaWorkingSetRecoveryCoordinator {
     recoveryEpoch &+= 1
     ready = false
     recovering = false
+    trackerResetEpoch = nil
     retryWaiters()
   }
 
@@ -670,8 +742,10 @@ private actor ElectricReplicaWorkingSetRecoveryCoordinator {
     guard !isTailRunnable else { return }
     let id = UUID()
     try await withTaskCancellationHandler {
-      try await withCheckedThrowingContinuation { continuation in
-        if isTailRunnable {
+      try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+        if Task.isCancelled {
+          continuation.resume(throwing: CancellationError())
+        } else if isTailRunnable {
           continuation.resume()
         } else {
           waiters[id] = continuation
@@ -707,6 +781,83 @@ private actor ElectricReplicaWorkingSetRecoveryCoordinator {
     waiters.removeAll()
     for continuation in continuations {
       continuation.resume(throwing: ElectricWorkingSetRecoveryRetry())
+    }
+  }
+}
+
+final class ElectricReplicaDemandTailFence: @unchecked Sendable {
+  struct Admission: Sendable, Equatable {
+    fileprivate let zeroDemandGeneration: UInt64
+  }
+
+  private let lock = NSLock()
+  private var leaseIDs: Set<UUID> = []
+  private var revision: UInt64 = 0
+  private var zeroDemandGeneration: UInt64 = 0
+  private var demandWaiters: [UUID: CheckedContinuation<Void, Error>] = [:]
+
+  var hasDemands: Bool { lock.withLock { !leaseIDs.isEmpty } }
+
+  func insert(_ id: UUID) {
+    let waiters = lock.withLock { () -> [CheckedContinuation<Void, Error>] in
+      let wasEmpty = leaseIDs.isEmpty
+      leaseIDs.insert(id)
+      revision &+= 1
+      guard wasEmpty else { return [] }
+      let values = Array(demandWaiters.values)
+      demandWaiters.removeAll()
+      return values
+    }
+    for waiter in waiters { waiter.resume() }
+  }
+
+  func remove(_ id: UUID) {
+    lock.withLock {
+      guard leaseIDs.remove(id) != nil else { return }
+      revision &+= 1
+      if leaseIDs.isEmpty {
+        // This synchronous transition is the tail cancellation fence. The
+        // stream checks the token before transport, after await, and before
+        // apply/reconnect; it can therefore never publish a stale tail batch.
+        zeroDemandGeneration &+= 1
+      }
+    }
+  }
+
+  func admitTailRequest() -> Admission? {
+    lock.withLock {
+      guard !leaseIDs.isEmpty else { return nil }
+      return Admission(zeroDemandGeneration: zeroDemandGeneration)
+    }
+  }
+
+  func isCurrent(_ admission: Admission) -> Bool {
+    lock.withLock {
+      !leaseIDs.isEmpty && zeroDemandGeneration == admission.zeroDemandGeneration
+    }
+  }
+
+  func waitUntilDemanded() async throws {
+    if hasDemands { return }
+    let id = UUID()
+    try await withTaskCancellationHandler {
+      try await withCheckedThrowingContinuation { continuation in
+        let resumeNow = lock.withLock { () -> Bool in
+          guard !Task.isCancelled, leaseIDs.isEmpty else { return true }
+          demandWaiters[id] = continuation
+          return false
+        }
+        if resumeNow {
+          if Task.isCancelled {
+            continuation.resume(throwing: CancellationError())
+          } else {
+            continuation.resume()
+          }
+        }
+      }
+    } onCancel: {
+      let waiter = self.lock.withLock { self.demandWaiters.removeValue(forKey: id) }
+      waiter?.resume(throwing: CancellationError())
     }
   }
 }

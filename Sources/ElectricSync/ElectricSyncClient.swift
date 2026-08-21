@@ -76,6 +76,7 @@ public struct SyncBatch<T: ElectricCollectionModel>: Sendable {
   private let shapeTopologyLatch: ElectricShapeTopologyLatch?
   private let protocolInputMessages: [ElectricMessage]
   private let replacesExclusiveWorkingSet: Bool
+  private let isExternallyForcedFullBootstrap: Bool
 
   fileprivate init(
     collectionIdentifier: String,
@@ -108,7 +109,8 @@ public struct SyncBatch<T: ElectricCollectionModel>: Sendable {
     shapeTopology: ElectricShapeTopology = .dnf,
     shapeTopologyLatch: ElectricShapeTopologyLatch? = nil,
     protocolInputMessages: [ElectricMessage]? = nil,
-    replacesExclusiveWorkingSet: Bool = false
+    replacesExclusiveWorkingSet: Bool = false,
+    isExternallyForcedFullBootstrap: Bool = false
   ) {
     self.collectionIdentifier = collectionIdentifier
     self.streamStateKey = streamStateKey
@@ -146,6 +148,7 @@ public struct SyncBatch<T: ElectricCollectionModel>: Sendable {
     self.shapeTopologyLatch = shapeTopologyLatch
     self.protocolInputMessages = protocolInputMessages ?? messages
     self.replacesExclusiveWorkingSet = replacesExclusiveWorkingSet
+    self.isExternallyForcedFullBootstrap = isExternallyForcedFullBootstrap
   }
 
   public struct Output: Sendable {
@@ -235,7 +238,8 @@ public struct SyncBatch<T: ElectricCollectionModel>: Sendable {
       shapeTopology: shapeTopology,
       shapeTopologyLatch: shapeTopologyLatch,
       protocolInputMessages: protocolInputMessages,
-      replacesExclusiveWorkingSet: replacesExclusiveWorkingSet
+      replacesExclusiveWorkingSet: replacesExclusiveWorkingSet,
+      isExternallyForcedFullBootstrap: isExternallyForcedFullBootstrap
     )
   }
 
@@ -414,7 +418,7 @@ public struct SyncBatch<T: ElectricCollectionModel>: Sendable {
           missingRowKeys: [],
           cursorOwnershipCollisionReports: cursorOwnershipCollisionReports
         )
-        output.recoveryCause = recoveryCause
+        output.recoveryCause = isExternallyForcedFullBootstrap ? nil : recoveryCause
         output.requiresReplacementSwap = true
         output.onTransactionCommitted = { moveOutTracker.reset() }
         return output
@@ -544,10 +548,21 @@ public struct SyncBatch<T: ElectricCollectionModel>: Sendable {
       // membership state and resume stays safe.
       let continuityFenceApplies =
         !metadataProvider.supportsDurableRowOwnership || taggedShapeCapabilityEnabled
+      // A protocol truncate/must-refetch is an external replacement cause and
+      // must never be reclassified as a local DNF-tracker loss. Likewise, an
+      // already-admitted forced `-1` response is the replacement baseline: it
+      // establishes fresh tracker continuity while it is applied rather than
+      // looping back to a synthetic local-loss reset.
+      let containsWireReplacementControl = messages.contains {
+        $0.kind == .truncate || $0.control == .mustRefetch
+      }
+      let isReplacementBaseline = isExternallyForcedFullBootstrap
       if continuityFenceApplies, !moveOutTracker.isContinuityEstablished {
-        if !resumedMidStream {
+        if !resumedMidStream || isReplacementBaseline {
           moveOutTracker.establishContinuity(taggedMode: taggedShapeCapabilityEnabled)
-        } else if messages.contains(where: Self.isTaggedProtocolInput) {
+        } else if !containsWireReplacementControl,
+          messages.contains(where: Self.isTaggedProtocolInput)
+        {
           batchMoveOutTracker.reset()
           return try forceTrackerLossFullBootstrap(
             reasonAttribute: "tracker_loss_full_bootstrap",
@@ -2480,7 +2495,8 @@ public actor ElectricSyncClientImpl {
         protocolSemanticEpoch: protocolSemanticEpoch,
         runtimeProvider: runtimeProvider,
         shapeTopology: effectiveShapeTopology,
-        shapeTopologyLatch: shapeTopologyLatch
+        shapeTopologyLatch: shapeTopologyLatch,
+        isExternallyForcedFullBootstrap: forceFullBootstrap
       )
     }
   }
