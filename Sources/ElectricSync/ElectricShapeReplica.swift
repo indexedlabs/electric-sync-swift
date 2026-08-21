@@ -290,12 +290,10 @@ public final class ElectricShapeReplica<Model: ElectricCollectionModel>: @unchec
     trackerContinuity.markEstablished(ifCurrent: trackerContinuity.currentGeneration)
   }
 
-  func failWorkingSetRecovery(epoch: UInt64? = nil) {
+  func failWorkingSetRecovery(epoch: UInt64? = nil) async {
     let trackerContinuity = trackerContinuity
-    Task {
-      await workingSetRecovery.failIfCurrent(epoch: epoch) {
-        trackerContinuity.markLost()
-      }
+    await workingSetRecovery.failIfCurrent(epoch: epoch) {
+      trackerContinuity.markLost()
     }
   }
 
@@ -469,6 +467,12 @@ public final class ElectricShapeReplica<Model: ElectricCollectionModel>: @unchec
   var publicationWaiterCount: Int {
     get async {
       await publicationGate.waiterCount
+    }
+  }
+
+  var queryAdmissionWaiterCount: Int {
+    get async {
+      await queryGate.waiterCount
     }
   }
 

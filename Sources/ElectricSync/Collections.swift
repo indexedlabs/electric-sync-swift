@@ -733,25 +733,32 @@ public struct ElectricCollection<T: ElectricCollectionModel>: Sendable {
     }
     do {
       let ownerOperation: @Sendable () async throws -> ElectricSubsetResult<T> = {
-        let appliedRecords = try await coordinator.performQuery(
-          client: client,
-          basePredicate: configuration.basePredicate,
-          shapeTopology: configuration.shapeTopology,
-          trackerContinuityRecoveryPolicy: configuration.trackerContinuityRecoveryPolicy,
-          descriptor: descriptor,
-          demandSyncMode: ownerSyncMode,
-          session: session,
-          snapshotReplica: replica,
-          ownerSnapshotDemand: true,
-          isActorOwnedWorkingSetRecoverySeed: isActiveWorkingSetRecoverySeed,
-          workingSetRecoveryEpoch: workingSetRecoveryEpoch,
-          workingSetRecoveryLossGeneration: workingSetRecoveryLossGeneration,
-          ownerPublicationAlreadyHeld: true,
-          consultFetchCoverage: false,
-          recordAsObservation: true,
-          transactionRunner: transactionRunner,
-          eventHandler: eventHandler
-        )
+        // A snapshot pauses the tail before it reaches this admission. This
+        // narrow gate keeps ordinary activation admission separate from an
+        // actor-owned recovery seed, so a tracker loss observed here can
+        // unwind the stale activation before the recovery leader re-enters.
+        let appliedRecords = try await replica.withQueryAdmission {
+          try await coordinator.performQuery(
+            client: client,
+            basePredicate: configuration.basePredicate,
+            shapeTopology: configuration.shapeTopology,
+            trackerContinuityRecoveryPolicy: configuration.trackerContinuityRecoveryPolicy,
+            descriptor: descriptor,
+            demandSyncMode: ownerSyncMode,
+            session: session,
+            snapshotReplica: replica,
+            ownerSnapshotDemand: true,
+            isActivationDemand: isActivationDemand,
+            isActorOwnedWorkingSetRecoverySeed: isActiveWorkingSetRecoverySeed,
+            workingSetRecoveryEpoch: workingSetRecoveryEpoch,
+            workingSetRecoveryLossGeneration: workingSetRecoveryLossGeneration,
+            ownerPublicationAlreadyHeld: true,
+            consultFetchCoverage: false,
+            recordAsObservation: true,
+            transactionRunner: transactionRunner,
+            eventHandler: eventHandler
+          )
+        }
 
         try Task.checkCancellation()
         guard isSessionCurrent() else { throw CancellationError() }
@@ -916,7 +923,7 @@ public struct ElectricCollection<T: ElectricCollectionModel>: Sendable {
       })
       return ElectricSubsetDemandActivation(lease: lease, result: result)
     } catch {
-      if let recoveryEpoch { replica.failWorkingSetRecovery(epoch: recoveryEpoch) }
+      if let recoveryEpoch { await replica.failWorkingSetRecovery(epoch: recoveryEpoch) }
       replica.releaseActiveDemand(leaseID)
       throw error
     }
@@ -1615,7 +1622,7 @@ public struct ElectricCollection<T: ElectricCollectionModel>: Sendable {
                   )
                 }
               } catch {
-                replica.failWorkingSetRecovery(epoch: recoveryToken.epoch)
+                await replica.failWorkingSetRecovery(epoch: recoveryToken.epoch)
                 throw error
               }
               continue
@@ -2069,6 +2076,7 @@ actor ElectricCollectionBackgroundCoordinator<T: ElectricCollectionModel> {
     session: ElectricSyncSession?,
     snapshotReplica: ElectricShapeReplica<T>? = nil,
     ownerSnapshotDemand: Bool = false,
+    isActivationDemand: Bool = false,
     isActorOwnedWorkingSetRecoverySeed: Bool = false,
     workingSetRecoveryEpoch: UInt64? = nil,
     workingSetRecoveryLossGeneration: UInt64? = nil,
@@ -2131,7 +2139,12 @@ actor ElectricCollectionBackgroundCoordinator<T: ElectricCollectionModel> {
         // The activation's outer admission can race a runtime loss. Only the
         // actor-elected recovery seed may reset from `now`; a normal demand
         // must return to activateDemand so it replays the complete lease set.
-        throw ElectricWorkingSetRecoveryRetry()
+        if isActivationDemand {
+          throw ElectricWorkingSetRecoveryRetry()
+        }
+        throw ElectricSyncError.fetchFailed(
+          "exclusive working-set recovery requires activateDemand"
+        )
       }
       if isActorOwnedWorkingSetRecoverySeed {
         guard let snapshotReplica,
@@ -2257,7 +2270,12 @@ actor ElectricCollectionBackgroundCoordinator<T: ElectricCollectionModel> {
             !isActorOwnedWorkingSetRecoverySeed,
             snapshotReplica?.isTrackerContinuityUnavailable == true
           {
-            throw ElectricWorkingSetRecoveryRetry()
+            if isActivationDemand {
+              throw ElectricWorkingSetRecoveryRetry()
+            }
+            throw ElectricSyncError.fetchFailed(
+              "exclusive working-set recovery requires activateDemand"
+            )
           }
           if isActorOwnedWorkingSetRecoverySeed {
             guard let snapshotReplica,
