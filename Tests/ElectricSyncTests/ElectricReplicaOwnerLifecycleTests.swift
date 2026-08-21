@@ -1911,6 +1911,217 @@ struct ElectricReplicaOwnerLifecycleTests {
   }
 
   @Test
+  func releasedLeaseDuringWorkingSetRecoveryDoesNotStrandTailOrRequireReleasedSubset() async throws {
+    let sessionController = TestSessionController()
+    let first = ReplicaTestRecord(id: "first", name: "First")
+    let tail = ReplicaTestRecord(id: "tail", name: "Tail")
+    let harness = ReplicaHarness<ReplicaTestRecord>(
+      responses: [
+        [
+          ElectricMessage.replicaRecord(first, offset: "first-offset", tags: ["shape"], isSubsetSnapshot: true),
+          ElectricMessage.replicaSubsetEnd(offset: "first-offset"),
+        ],
+        [
+          ElectricMessage.replicaRecord(tail, offset: "tail-offset", tags: ["shape"]),
+          ElectricMessage.replicaUpToDate(offset: "tail-offset"),
+        ],
+      ],
+      syncMode: .onDemand,
+      isExactCursorCutoverEnabled: true,
+      blocksFirstFetchUntilResumed: true,
+      protocolCapabilityPolicy: .enabled,
+      shapeTopology: .dnf,
+      trackerContinuityRecoveryPolicy: .replaceExclusiveWorkingSetFromDemandedSubsets
+    )
+    let session = try #require(sessionController.captureAuthenticatedSession())
+    let firstTask = Task {
+      try await harness.collection.activateDemand(
+        where: SQLExpression(predicate: .equals(field: "id", value: .string("first"))),
+        session: session
+      )
+    }
+    try await waitUntilTrueAsync { await harness.http.requestCount() == 1 }
+    let releasedTask = Task {
+      try await harness.collection.activateDemand(
+        where: SQLExpression(predicate: .equals(field: "id", value: .string("released"))),
+        session: session
+      )
+    }
+    try await waitUntilTrueAsync {
+      await harness.collection.replica.activeDemandDescriptors().count == 2
+    }
+    releasedTask.cancel()
+    await #expect(throws: CancellationError.self) { try await releasedTask.value }
+    try await waitUntilTrueAsync {
+      await harness.collection.replica.activeDemandDescriptors().count == 1
+    }
+    await harness.http.resumeFirstFetch()
+    let firstActivation = try await firstTask.value
+    defer { firstActivation.lease.cancel() }
+    try await waitUntilTrueAsync { harness.store.storedIDs().contains(tail.id) }
+    let requests = await harness.http.capturedRequests()
+    #expect(requests.count >= 2)
+    #expect(requests[0].offset == "now")
+    #expect(requests[1].offset == "first-offset")
+    #expect(requests[1].subset == nil)
+    #expect(!requests.contains { $0.offset == "-1" })
+  }
+
+  @Test
+  func failedWorkingSetSeedLeavesTailParkedAndLaterActivationRetriesFromNow() async throws {
+    let sessionController = TestSessionController()
+    let recovered = ReplicaTestRecord(id: "recovered", name: "Recovered")
+    let harness = ReplicaHarness<ReplicaTestRecord>(
+      responses: [
+        [
+          ElectricMessage.replicaRecord(
+            recovered, offset: "recovered-offset", tags: ["shape"], isSubsetSnapshot: true
+          ),
+          ElectricMessage.replicaSubsetEnd(offset: "recovered-offset"),
+        ],
+      ],
+      syncMode: .onDemand,
+      isExactCursorCutoverEnabled: true,
+      cancellationAwareBlockedRequestIndex: 1,
+      protocolCapabilityPolicy: .enabled,
+      shapeTopology: .dnf,
+      trackerContinuityRecoveryPolicy: .replaceExclusiveWorkingSetFromDemandedSubsets
+    )
+    let session = try #require(sessionController.captureAuthenticatedSession())
+    let failedActivation = Task {
+      try await harness.collection.activateDemand(
+        where: SQLExpression(predicate: .equals(field: "id", value: .string("failed"))),
+        session: session
+      )
+    }
+    try await waitUntilTrueAsync { await harness.http.requestCount() == 1 }
+    await harness.http.cancelBlockedFetchForTest()
+    await #expect(throws: CancellationError.self) { try await failedActivation.value }
+
+    let recoveredActivation = try await harness.collection.activateDemand(
+      where: SQLExpression(predicate: .equals(field: "id", value: .string("recovered"))),
+      session: session
+    )
+    defer { recoveredActivation.lease.cancel() }
+    #expect(recoveredActivation.result.appliedRecords == [recovered])
+    let requests = await harness.http.capturedRequests()
+    #expect(requests.count >= 2)
+    #expect(requests[0].offset == "now")
+    #expect(requests[1].offset == "now")
+    #expect(!requests.contains { $0.offset == "-1" })
+  }
+
+  @Test
+  func taggedTailTrackerLossReplaysActiveLeaseWithoutFullBootstrap() async throws {
+    let sessionController = TestSessionController()
+    let seed = ReplicaTestRecord(id: "seed", name: "Seed")
+    let replayedSeed = ReplicaTestRecord(id: "seed", name: "Seed replayed")
+    let postRecoveryTail = ReplicaTestRecord(id: "post-recovery", name: "Post recovery")
+    let harness = ReplicaHarness<ReplicaTestRecord>(
+      responses: [
+        [
+          ElectricMessage.replicaRecord(seed, offset: "seed-offset", tags: ["shape"], isSubsetSnapshot: true),
+          ElectricMessage.replicaSubsetEnd(offset: "seed-offset"),
+        ],
+        [ElectricMessage.replicaUpToDate(offset: "tail-before-loss")],
+        [
+          ElectricMessage.replicaRecord(
+            ReplicaTestRecord(id: "discarded", name: "Discarded"),
+            offset: "lost-offset",
+            tags: ["shape"]
+          ),
+          ElectricMessage.replicaUpToDate(offset: "lost-offset"),
+        ],
+        [
+          ElectricMessage.replicaRecord(
+            replayedSeed, offset: "reseed-offset", tags: ["shape"], isSubsetSnapshot: true
+          ),
+          ElectricMessage.replicaSubsetEnd(offset: "reseed-offset"),
+        ],
+        [
+          ElectricMessage.replicaRecord(postRecoveryTail, offset: "tail-after-loss", tags: ["shape"]),
+          ElectricMessage.replicaUpToDate(offset: "tail-after-loss"),
+        ],
+      ],
+      syncMode: .onDemand,
+      isExactCursorCutoverEnabled: true,
+      blocksRequestIndexUntilResumed: 3,
+      protocolCapabilityPolicy: .enabled,
+      shapeTopology: .dnf,
+      trackerContinuityRecoveryPolicy: .replaceExclusiveWorkingSetFromDemandedSubsets
+    )
+    let session = try #require(sessionController.captureAuthenticatedSession())
+    let activation = try await harness.collection.activateDemand(
+      where: SQLExpression(predicate: .equals(field: "id", value: .string("seed"))), session: session
+    )
+    defer { activation.lease.cancel() }
+
+    try await waitUntilTrueAsync { await harness.http.requestCount() >= 3 }
+    await harness.client.invalidateProcessLocalTracker(
+      identity: harness.collection.replica.identity,
+      syncMode: .onDemand
+    )
+    await harness.http.resumeBlockedFetch()
+    try await waitUntilTrueAsync {
+      await harness.http.requestCount() >= 5
+    }
+    let requests = await harness.http.capturedRequests()
+    #expect(requests[3].offset == "now")
+    #expect(requests[3].subset != nil)
+    #expect(requests[4].offset == "reseed-offset")
+    #expect(requests[4].subset == nil)
+    #expect(!requests.contains { $0.offset == "-1" })
+    try await waitUntilTrueAsync { harness.store.storedIDs().contains(postRecoveryTail.id) }
+    #expect(harness.store.storedIDs() == [replayedSeed.id, postRecoveryTail.id])
+  }
+
+  @Test
+  func invalidWorkingSetPolicyAndDisguisedTrueDemandFailBeforeHTTP() async throws {
+    let sessionController = TestSessionController()
+    let session = try #require(sessionController.captureAuthenticatedSession())
+    let invalidConfiguration = ReplicaHarness<ReplicaTestRecord>(
+      responses: [],
+      syncMode: .onDemand,
+      supportsDurableRowOwnership: false,
+      protocolCapabilityPolicy: .enabled,
+      shapeTopology: .dnf,
+      trackerContinuityRecoveryPolicy: .replaceExclusiveWorkingSetFromDemandedSubsets
+    )
+    await #expect(throws: ElectricSyncError.self) {
+      try await invalidConfiguration.collection.activateDemand(
+        where: SQLExpression(predicate: .equals(field: "id", value: .string("x"))),
+        session: session
+      )
+    }
+    #expect(await invalidConfiguration.http.requestCount() == 0)
+    await #expect(throws: ElectricSyncError.self) {
+      try await invalidConfiguration.collection.ensureSubset(
+        where: SQLExpression(predicate: .equals(field: "id", value: .string("x"))),
+        session: session
+      )
+    }
+    let rawToken = invalidConfiguration.collection.keepSynced(session: session)
+    await Task.yield()
+    rawToken.cancel()
+    #expect(await invalidConfiguration.http.requestCount() == 0)
+
+    let eligibleConfiguration = ReplicaHarness<ReplicaTestRecord>(
+      responses: [],
+      syncMode: .onDemand,
+      protocolCapabilityPolicy: .enabled,
+      shapeTopology: .dnf,
+      trackerContinuityRecoveryPolicy: .replaceExclusiveWorkingSetFromDemandedSubsets
+    )
+    await #expect(throws: ElectricSyncError.self) {
+      try await eligibleConfiguration.collection.activateDemand(
+        where: SQLExpression(predicate: .not(.constant(false))),
+        session: session
+      )
+    }
+    #expect(await eligibleConfiguration.http.requestCount() == 0)
+  }
+
+  @Test
   func semanticEpochTransitionStillFullBootstrapsBeforeOnDemandSubset() async throws {
     let sessionController = TestSessionController()
     do {
@@ -2645,6 +2856,7 @@ private final class ReplicaHarness<Model: ElectricCollectionModel>: @unchecked S
     isExactCursorCutoverEnabled: Bool = false,
     gcTime: TimeInterval = ElectricCollectionStreamManager.defaultGCTime,
     blocksFirstFetchUntilResumed: Bool = false,
+    blocksRequestIndexUntilResumed: Int? = nil,
     cancellationAwareBlockedRequestIndex: Int? = nil,
     transactionGate: ReplicaTransactionGate? = nil,
     legacyBootstrapAdmissionController: ElectricLegacyBootstrapAdmissionController? = nil,
@@ -2673,6 +2885,7 @@ private final class ReplicaHarness<Model: ElectricCollectionModel>: @unchecked S
     let http = ReplicaInMemoryHTTPClientProvider(
       responses: responses,
       blocksFirstFetchUntilResumed: blocksFirstFetchUntilResumed,
+      blocksRequestIndexUntilResumed: blocksRequestIndexUntilResumed,
       cancellationAwareBlockedRequestIndex: cancellationAwareBlockedRequestIndex,
       protocolErrorRequestIndexes: protocolErrorRequestIndexes
     )
@@ -2977,10 +3190,13 @@ private actor ReplicaInMemoryHTTPClientProvider: HTTPClientProvider {
   private var responses: [[ElectricMessage]]
   private var requests: [ElectricShapeRequest] = []
   private let blocksFirstFetchUntilResumed: Bool
+  private let blocksRequestIndexUntilResumed: Int?
   private let cancellationAwareBlockedRequestIndex: Int?
   private let protocolErrorRequestIndexes: Set<Int>
   private var firstFetchReleaseRequested = false
   private var firstFetchContinuation: CheckedContinuation<Void, Never>?
+  private var blockedFetchReleaseRequested = false
+  private var blockedFetchReleaseContinuation: CheckedContinuation<Void, Never>?
   private var blockedFetchContinuation: CheckedContinuation<[ElectricMessage], Error>?
   private var cancelledFetches = 0
   private var afterNextProtocolError: (@Sendable () -> Void)?
@@ -2988,11 +3204,13 @@ private actor ReplicaInMemoryHTTPClientProvider: HTTPClientProvider {
   init(
     responses: [[ElectricMessage]],
     blocksFirstFetchUntilResumed: Bool = false,
+    blocksRequestIndexUntilResumed: Int? = nil,
     cancellationAwareBlockedRequestIndex: Int? = nil,
     protocolErrorRequestIndexes: Set<Int> = []
   ) {
     self.responses = responses
     self.blocksFirstFetchUntilResumed = blocksFirstFetchUntilResumed
+    self.blocksRequestIndexUntilResumed = blocksRequestIndexUntilResumed
     self.cancellationAwareBlockedRequestIndex = cancellationAwareBlockedRequestIndex
     self.protocolErrorRequestIndexes = protocolErrorRequestIndexes
   }
@@ -3011,6 +3229,15 @@ private actor ReplicaInMemoryHTTPClientProvider: HTTPClientProvider {
           continuation.resume()
         } else {
           firstFetchContinuation = continuation
+        }
+      }
+    }
+    if requests.count == blocksRequestIndexUntilResumed, !blockedFetchReleaseRequested {
+      await withCheckedContinuation { continuation in
+        if blockedFetchReleaseRequested {
+          continuation.resume()
+        } else {
+          blockedFetchReleaseContinuation = continuation
         }
       }
     }
@@ -3047,6 +3274,12 @@ private actor ReplicaInMemoryHTTPClientProvider: HTTPClientProvider {
     firstFetchReleaseRequested = true
     firstFetchContinuation?.resume()
     firstFetchContinuation = nil
+  }
+
+  func resumeBlockedFetch() {
+    blockedFetchReleaseRequested = true
+    blockedFetchReleaseContinuation?.resume()
+    blockedFetchReleaseContinuation = nil
   }
 
   func requestCount() -> Int {
