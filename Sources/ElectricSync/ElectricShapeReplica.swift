@@ -206,6 +206,7 @@ public final class ElectricShapeReplica<Model: ElectricCollectionModel>: @unchec
   private let replacementBufferingCount = ElectricReplicaAtomicCounter()
   private let trackerContinuity = ElectricReplicaTrackerContinuity()
   private let workingSetRecovery = ElectricReplicaWorkingSetRecoveryCoordinator()
+  private let workingSetRecoveryConfiguration = ElectricReplicaWorkingSetRecoveryConfiguration()
   private let demandTailFence = ElectricReplicaDemandTailFence()
   private let lifecycleTestHooks = ElectricReplicaLifecycleTestHooks()
   private let progressiveInitialBuffer: ElectricProgressiveInitialBuffer
@@ -356,6 +357,16 @@ public final class ElectricShapeReplica<Model: ElectricCollectionModel>: @unchec
     get async { await workingSetRecovery.isTailRunnable(hasDemands: demandTailFence.hasDemands) }
   }
 
+  func bindWorkingSetRecoveryConfiguration(
+    policy: ElectricTrackerContinuityRecoveryPolicy,
+    descriptors: [ElectricWorkingSetRecoveryDescriptor]
+  ) -> Bool {
+    workingSetRecoveryConfiguration.bind(
+      policy: policy,
+      descriptors: descriptors
+    )
+  }
+
   func waitForWorkingSetTailRunnable() async throws {
     try workGate.checkAcceptingWork()
     try Task.checkCancellation()
@@ -434,11 +445,19 @@ public final class ElectricShapeReplica<Model: ElectricCollectionModel>: @unchec
     )
   }
 
-  func workingSetRecoverySnapshot(prioritizing first: QueryDescriptor? = nil) async
+  func workingSetRecoverySnapshot(
+    configured configuredDescriptors: [QueryDescriptor] = [],
+    prioritizing first: QueryDescriptor? = nil
+  ) async
     -> (revision: UInt64, descriptors: [QueryDescriptor])
   {
     let snapshot = demandTailFence.descriptorSnapshot()
-    return (snapshot.revision, Self.sortedDemandDescriptors(snapshot.values, prioritizing: first))
+    let activeDescriptors = Self.sortedDemandDescriptors(snapshot.values, prioritizing: first)
+    var seen = Set<QueryDescriptor>()
+    let stableUnion = (configuredDescriptors + activeDescriptors).filter {
+      seen.insert($0).inserted
+    }
+    return (snapshot.revision, stableUnion)
   }
 
   func completeWorkingSetRecoveryIfStable(
@@ -683,6 +702,28 @@ enum ElectricWorkingSetRecoveryCompletion: Sendable, Equatable {
   case staleGeneration
 }
 
+private final class ElectricReplicaWorkingSetRecoveryConfiguration: @unchecked Sendable {
+  private struct Binding: Equatable {
+    let policy: ElectricTrackerContinuityRecoveryPolicy
+    let descriptors: [ElectricWorkingSetRecoveryDescriptor]
+  }
+
+  private let lock = NSLock()
+  private var binding: Binding?
+
+  func bind(
+    policy: ElectricTrackerContinuityRecoveryPolicy,
+    descriptors: [ElectricWorkingSetRecoveryDescriptor]
+  ) -> Bool {
+    let candidate = Binding(policy: policy, descriptors: descriptors)
+    return lock.withLock {
+      if let binding { return binding == candidate }
+      binding = candidate
+      return true
+    }
+  }
+}
+
 private actor ElectricReplicaWorkingSetRecoveryCoordinator {
   private var recovering = false
   private var ready = false
@@ -861,7 +902,6 @@ final class ElectricReplicaDemandTailFence: @unchecked Sendable {
   func insert(_ id: UUID, descriptor: QueryDescriptor) {
     lock.withLock {
       descriptors[id] = descriptor
-      revision &+= 1
     }
   }
 
@@ -873,6 +913,7 @@ final class ElectricReplicaDemandTailFence: @unchecked Sendable {
       guard descriptors[id] != nil else { return [] }
       let wasEmpty = committedDemandIDs.isEmpty
       guard committedDemandIDs.insert(id).inserted else { return [] }
+      revision &+= 1
       guard wasEmpty else { return [] }
       let values = Array(demandWaiters.values)
       demandWaiters.removeAll()
@@ -884,8 +925,11 @@ final class ElectricReplicaDemandTailFence: @unchecked Sendable {
   func remove(_ id: UUID) {
     lock.withLock {
       guard descriptors.removeValue(forKey: id) != nil else { return }
-      revision &+= 1
-      if committedDemandIDs.remove(id) != nil, committedDemandIDs.isEmpty {
+      let removedCommittedDemand = committedDemandIDs.remove(id) != nil
+      if removedCommittedDemand {
+        revision &+= 1
+      }
+      if removedCommittedDemand, committedDemandIDs.isEmpty {
         // This synchronous transition is the tail cancellation fence. The
         // stream checks the token before transport, after await, and before
         // apply/reconnect; it can therefore never publish a stale tail batch.
@@ -932,7 +976,12 @@ final class ElectricReplicaDemandTailFence: @unchecked Sendable {
   }
 
   func descriptorSnapshot() -> (revision: UInt64, values: [UUID: QueryDescriptor]) {
-    lock.withLock { (revision, descriptors) }
+    lock.withLock {
+      (
+        revision,
+        descriptors.filter { committedDemandIDs.contains($0.key) }
+      )
+    }
   }
 }
 
