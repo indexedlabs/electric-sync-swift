@@ -1784,12 +1784,15 @@ struct ElectricReplicaOwnerLifecycleTests {
       harness.metadata.seedOwnedRow(table: ReplicaTestRecord.tableName, rowKey: staleRecord.id)
       let session = try #require(sessionController.captureAuthenticatedSession())
 
-      _ = try await harness.collection.ensureSubset(
+      let activation = try await harness.collection.activateDemand(
         where: SQLExpression(predicate: .equals(field: "id", value: .string("seed"))),
         session: session
       )
+      defer { activation.lease.cancel() }
 
       #expect(!replica.isTrackerContinuityUnavailable)
+      #expect(activation.result.appliedRecords.map(\.id) == [seedRecord.id])
+      #expect(activation.result.localRecords.map(\.id) == [seedRecord.id])
       #expect(harness.store.storedIDs() == [seedRecord.id])
       let requests = await harness.http.capturedRequests()
       #expect(requests.count == 1)
@@ -1805,6 +1808,106 @@ struct ElectricReplicaOwnerLifecycleTests {
       #expect(tailRequest.offset == "offset-seed")
       #expect(tailRequest.log == .changesOnly)
     }
+  }
+
+  @Test
+  func optedInDNFWorkingSetParksRawTailUntilAnActivationSeedsIt() async throws {
+    let sessionController = TestSessionController()
+    let seed = ReplicaTestRecord(id: "seed", name: "Seed")
+    let tail = ReplicaTestRecord(id: "tail", name: "Tail")
+    let harness = ReplicaHarness<ReplicaTestRecord>(
+      responses: [
+        [
+          ElectricMessage.replicaRecord(seed, offset: "seed-offset", tags: ["shape"], isSubsetSnapshot: true),
+          ElectricMessage.replicaSubsetEnd(offset: "seed-offset"),
+        ],
+        [
+          ElectricMessage.replicaRecord(tail, offset: "tail-offset", tags: ["shape"]),
+          ElectricMessage.replicaUpToDate(offset: "tail-offset"),
+        ],
+      ],
+      syncMode: .onDemand,
+      isExactCursorCutoverEnabled: true,
+      protocolCapabilityPolicy: .enabled,
+      shapeTopology: .dnf,
+      trackerContinuityRecoveryPolicy: .replaceExclusiveWorkingSetFromDemandedSubsets
+    )
+    let session = try #require(sessionController.captureAuthenticatedSession())
+    let rawTail = harness.collection.keepSynced(session: session)
+    await Task.yield()
+    #expect(await harness.http.requestCount() == 0)
+    rawTail.cancel()
+
+    let activation = try await harness.collection.activateDemand(
+      where: SQLExpression(predicate: .equals(field: "id", value: .string("seed"))), session: session
+    )
+    defer { activation.lease.cancel() }
+    try await waitUntilTrueAsync { harness.store.storedIDs().contains(tail.id) }
+    let requests = await harness.http.capturedRequests()
+    #expect(requests.prefix(2).map(\.offset) == ["now", "seed-offset"])
+    #expect(!requests.contains { $0.offset == "-1" })
+  }
+
+  @Test
+  func concurrentDNFActivationsSeedStableLeaseInventoryBeforeTail() async throws {
+    let sessionController = TestSessionController()
+    let first = ReplicaTestRecord(id: "first", name: "First")
+    let second = ReplicaTestRecord(id: "second", name: "Second")
+    let tail = ReplicaTestRecord(id: "tail", name: "Tail")
+    let harness = ReplicaHarness<ReplicaTestRecord>(
+      responses: [
+        [
+          ElectricMessage.replicaRecord(first, offset: "first-offset", tags: ["shape"], isSubsetSnapshot: true),
+          ElectricMessage.replicaSubsetEnd(offset: "first-offset"),
+        ],
+        [
+          ElectricMessage.replicaRecord(second, offset: "second-offset", tags: ["shape"], isSubsetSnapshot: true),
+          ElectricMessage.replicaSubsetEnd(offset: "second-offset"),
+        ],
+        [
+          ElectricMessage.replicaRecord(tail, offset: "tail-offset", tags: ["shape"]),
+          ElectricMessage.replicaUpToDate(offset: "tail-offset"),
+        ],
+      ],
+      syncMode: .onDemand,
+      isExactCursorCutoverEnabled: true,
+      blocksFirstFetchUntilResumed: true,
+      protocolCapabilityPolicy: .enabled,
+      shapeTopology: .dnf,
+      trackerContinuityRecoveryPolicy: .replaceExclusiveWorkingSetFromDemandedSubsets
+    )
+    let session = try #require(sessionController.captureAuthenticatedSession())
+    let firstTask = Task {
+      try await harness.collection.activateDemand(
+        where: SQLExpression(predicate: .equals(field: "id", value: .string("first"))),
+        session: session
+      )
+    }
+    try await waitUntilTrueAsync { await harness.http.requestCount() == 1 }
+    let secondTask = Task {
+      try await harness.collection.activateDemand(
+        where: SQLExpression(predicate: .equals(field: "id", value: .string("second"))),
+        session: session
+      )
+    }
+    try await waitUntilTrueAsync {
+      await harness.collection.replica.activeDemandDescriptors().count == 2
+    }
+    await harness.http.resumeFirstFetch()
+    let firstActivation = try await firstTask.value
+    let secondActivation = try await secondTask.value
+    defer {
+      firstActivation.lease.cancel()
+      secondActivation.lease.cancel()
+    }
+    try await waitUntilTrueAsync { harness.store.storedIDs().contains(tail.id) }
+    let requests = await harness.http.capturedRequests()
+    #expect(requests.count >= 3)
+    #expect(requests[0].offset == "now")
+    #expect(requests[1].offset == "first-offset")
+    #expect(requests[2].offset == "second-offset")
+    #expect(requests[0].subset != nil && requests[1].subset != nil && requests[2].subset == nil)
+    #expect(!requests.contains { $0.offset == "-1" })
   }
 
   @Test
@@ -3050,6 +3153,7 @@ private final class ReplicaInMemoryMetadataProvider: MetadataProvider, @unchecke
   // responses. Tests that pin the process-local (non-durable) tracker
   // contract pass false explicitly.
   let supportsDurableRowOwnership: Bool
+  var supportsExclusiveWorkingSetReset: Bool { supportsDurableRowOwnership }
   private let trackerRebuildAdmissionError: Bool
   private let trackerRebuildOwnershipTags: [String: [String]]?
   private let admitsFreshOnDemandPristineOwner: Bool

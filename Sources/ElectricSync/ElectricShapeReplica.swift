@@ -205,8 +205,7 @@ public final class ElectricShapeReplica<Model: ElectricCollectionModel>: @unchec
   private let workGate = ElectricReplicaWorkGate()
   private let replacementBufferingCount = ElectricReplicaAtomicCounter()
   private let trackerContinuity = ElectricReplicaTrackerContinuity()
-  private let workingSetTailReadiness = ElectricReplicaWorkingSetTailReadiness()
-  private let activeDemandLeases = ElectricReplicaDemandLeases()
+  private let workingSetRecovery = ElectricReplicaWorkingSetRecoveryCoordinator()
   private let progressiveInitialBuffer: ElectricProgressiveInitialBuffer
 
   public init(
@@ -254,11 +253,11 @@ public final class ElectricShapeReplica<Model: ElectricCollectionModel>: @unchec
       diagnostics: client.cursorOwnershipDiagnostics
     )
     let trackerContinuity = self.trackerContinuity
-    let workingSetTailReadiness = self.workingSetTailReadiness
+    let workingSetRecovery = self.workingSetRecovery
     let progressiveInitialBuffer = self.progressiveInitialBuffer
     self.streamController.onRuntimeOwnerEviction = {
-      trackerContinuity.markLost()
-      workingSetTailReadiness.failRecovery()
+      let generation = trackerContinuity.markLost()
+      Task { await workingSetRecovery.markLost(generation: generation) }
       progressiveInitialBuffer.restart()
     }
   }
@@ -285,42 +284,73 @@ public final class ElectricShapeReplica<Model: ElectricCollectionModel>: @unchec
   }
 
   func markTrackerContinuityEstablished() {
-    trackerContinuity.markEstablished()
+    trackerContinuity.markEstablished(ifCurrent: trackerContinuity.currentGeneration)
   }
 
-  func beginWorkingSetRecovery() {
-    workingSetTailReadiness.beginRecovery()
+  func failWorkingSetRecovery(epoch: UInt64? = nil) {
+    _ = trackerContinuity.markLost()
+    Task { await workingSetRecovery.fail(epoch: epoch) }
   }
 
-  func completeWorkingSetRecovery() {
-    workingSetTailReadiness.completeRecovery()
+  var isWorkingSetTailReady: Bool {
+    get async { await workingSetRecovery.isReady }
   }
-
-  func failWorkingSetRecovery() {
-    trackerContinuity.markLost()
-    workingSetTailReadiness.failRecovery()
-  }
-
-  var isWorkingSetTailReady: Bool { workingSetTailReadiness.isReady }
 
   func waitForWorkingSetTailReadiness() async throws {
     try workGate.checkAcceptingWork()
     try Task.checkCancellation()
-    await workingSetTailReadiness.waitUntilReady()
+    try await workingSetRecovery.waitUntilReady()
     try workGate.checkAcceptingWork()
     try Task.checkCancellation()
   }
 
-  func registerActiveDemand(_ descriptor: QueryDescriptor) -> UUID {
-    activeDemandLeases.register(descriptor)
+  func registerActiveDemand(_ descriptor: QueryDescriptor) async -> UUID {
+    await workingSetRecovery.register(descriptor)
   }
 
   func releaseActiveDemand(_ id: UUID) {
-    activeDemandLeases.release(id)
+    Task { await workingSetRecovery.release(id) }
   }
 
-  func activeDemandDescriptors(prioritizing first: QueryDescriptor? = nil) -> [QueryDescriptor] {
-    activeDemandLeases.descriptors(prioritizing: first)
+  func startWorkingSetRecoveryIfNeeded() async -> (epoch: UInt64, lossGeneration: UInt64)? {
+    await workingSetRecovery.startIfNeeded(
+      trackerUnavailable: isTrackerContinuityUnavailable,
+      lossGeneration: trackerContinuity.currentGeneration
+    )
+  }
+
+  func workingSetRecoverySnapshot(prioritizing first: QueryDescriptor? = nil) async
+    -> (revision: UInt64, descriptors: [QueryDescriptor])
+  {
+    await workingSetRecovery.snapshot(prioritizing: first)
+  }
+
+  func completeWorkingSetRecoveryIfStable(
+    revision: UInt64,
+    epoch: UInt64,
+    lossGeneration: UInt64
+  ) async -> Bool {
+    await workingSetRecovery.completeIfStable(
+      revision: revision,
+      epoch: epoch,
+      lossGeneration: lossGeneration
+    ) { [trackerContinuity] in
+      trackerContinuity.markEstablished(ifCurrent: lossGeneration)
+    }
+  }
+
+  func workingSetRecoveryNeedsSeed() async -> Bool { await workingSetRecovery.needsSeed }
+
+  func resumeWorkingSetTailForActiveLease() async {
+    await workingSetRecovery.resumeForActiveLease()
+  }
+
+  func isWorkingSetRecoveryCurrent(epoch: UInt64, lossGeneration: UInt64) async -> Bool {
+    await workingSetRecovery.isCurrent(epoch: epoch, lossGeneration: lossGeneration)
+  }
+
+  func activeDemandDescriptors(prioritizing first: QueryDescriptor? = nil) async -> [QueryDescriptor] {
+    await workingSetRecovery.snapshot(prioritizing: first).descriptors
   }
 
 
@@ -471,23 +501,23 @@ public final class ElectricShapeReplica<Model: ElectricCollectionModel>: @unchec
 
   public func cancel() {
     workGate.close()
-    trackerContinuity.markLost()
-    workingSetTailReadiness.failRecovery()
+    let generation = trackerContinuity.markLost()
+    Task { await workingSetRecovery.markLost(generation: generation) }
     progressiveInitialBuffer.finish()
     streamController.cancelAll()
   }
 
   public func closeWorkGate() {
     workGate.close()
-    trackerContinuity.markLost()
-    workingSetTailReadiness.failRecovery()
+    let generation = trackerContinuity.markLost()
+    Task { await workingSetRecovery.markLost(generation: generation) }
     progressiveInitialBuffer.finish()
   }
 
   public func cancelAndWait() async {
     workGate.close()
-    trackerContinuity.markLost()
-    workingSetTailReadiness.failRecovery()
+    let generation = trackerContinuity.markLost()
+    Task { await workingSetRecovery.markLost(generation: generation) }
     progressiveInitialBuffer.finish()
     async let streamCancellation: Void = streamController.cancelAllAndWait()
     async let queryCancellation: Void = coordinator.cancelAllAndWait()
@@ -504,58 +534,148 @@ public final class ElectricShapeReplica<Model: ElectricCollectionModel>: @unchec
   }
 }
 
-private final class ElectricReplicaWorkingSetTailReadiness: @unchecked Sendable {
-  private let lock = NSLock()
-  private var ready = false
-  private var waiters: [CheckedContinuation<Void, Never>] = []
-
-  var isReady: Bool { lock.withLock { ready } }
-
-  func beginRecovery() { lock.withLock { ready = false } }
-  func completeRecovery() {
-    let waiters = lock.withLock { () -> [CheckedContinuation<Void, Never>] in
-      ready = true
-      defer { self.waiters.removeAll() }
-      return self.waiters
-    }
-    for waiter in waiters { waiter.resume() }
-  }
-  func failRecovery() {
-    let waiters = lock.withLock { () -> [CheckedContinuation<Void, Never>] in
-      ready = false
-      defer { self.waiters.removeAll() }
-      return self.waiters
-    }
-    for waiter in waiters { waiter.resume() }
-  }
-  func waitUntilReady() async {
-    guard !isReady else { return }
-    await withCheckedContinuation { continuation in
-      let resumeNow = lock.withLock {
-        guard !ready else { return true }
-        waiters.append(continuation)
-        return false
-      }
-      if resumeNow { continuation.resume() }
-    }
-  }
-}
-
-private final class ElectricReplicaDemandLeases: @unchecked Sendable {
-  private let lock = NSLock()
+/// The sole mutable authority for the bounded DNF working set. A revision is
+/// bumped for every lease mutation, so a seeding leader can never release the
+/// tail from a stale inventory. This actor also makes the parked-tail wait
+/// cancellable: cancelling a stream token cannot strand an activation that is
+/// about to seed it.
+private actor ElectricReplicaWorkingSetRecoveryCoordinator {
   private var values: [UUID: QueryDescriptor] = [:]
+  private var revision: UInt64 = 0
+  private var recovering = false
+  private var ready = false
+  private var recoveryEpoch: UInt64 = 0
+  private var knownLossGeneration: UInt64 = 0
+  private var recoveryLossGeneration: UInt64 = 0
+  private var waiters: [UUID: CheckedContinuation<Void, Error>] = [:]
+
+  var isReady: Bool { ready }
+  var needsSeed: Bool { recovering || !ready }
+
+  func isCurrent(epoch: UInt64, lossGeneration: UInt64) -> Bool {
+    recovering && recoveryEpoch == epoch && recoveryLossGeneration == lossGeneration
+  }
+
   func register(_ descriptor: QueryDescriptor) -> UUID {
     let id = UUID()
-    lock.withLock { values[id] = descriptor }
+    values[id] = descriptor
+    revision &+= 1
     return id
   }
-  func release(_ id: UUID) { _ = lock.withLock { values.removeValue(forKey: id) } }
-  func descriptors(prioritizing first: QueryDescriptor?) -> [QueryDescriptor] {
-    lock.withLock {
-      let all = Set(values.values)
-      guard let first else { return all.sorted { $0.rawSortKey < $1.rawSortKey } }
-      return [first] + all.subtracting([first]).sorted { $0.rawSortKey < $1.rawSortKey }
+
+  func release(_ id: UUID) {
+    guard values.removeValue(forKey: id) != nil else { return }
+    revision &+= 1
+    if values.isEmpty, !recovering { ready = false }
+  }
+
+  func resumeForActiveLease() {
+    guard !values.isEmpty, !recovering, !ready else { return }
+    ready = true
+    let continuations = waiters.values
+    waiters.removeAll()
+    for continuation in continuations { continuation.resume() }
+  }
+
+  /// Returns true for exactly one recovery leader. It deliberately leaves
+  /// `ready` false when there are no leases: the tail must stay parked rather
+  /// than inventing an unbounded bootstrap.
+  func startIfNeeded(
+    trackerUnavailable: Bool,
+    lossGeneration: UInt64
+  ) -> (epoch: UInt64, lossGeneration: UInt64)? {
+    guard trackerUnavailable, !values.isEmpty else { return nil }
+    // The synchronous tracker flag is the authoritative loss fence. This
+    // closes the small window between an eviction callback and its actor hop.
+    if lossGeneration > knownLossGeneration {
+      knownLossGeneration = lossGeneration
+      ready = false
+      recovering = false
     }
+    guard !recovering else { return nil }
+    recovering = true
+    recoveryEpoch &+= 1
+    recoveryLossGeneration = lossGeneration
+    return (recoveryEpoch, lossGeneration)
+  }
+
+  func snapshot(prioritizing first: QueryDescriptor?) -> (revision: UInt64, descriptors: [QueryDescriptor]) {
+    let all = Set(values.values)
+    let descriptors: [QueryDescriptor]
+    if let first, all.contains(first) {
+      descriptors = [first] + all.subtracting([first]).sorted { $0.rawSortKey < $1.rawSortKey }
+    } else {
+      descriptors = all.sorted { $0.rawSortKey < $1.rawSortKey }
+    }
+    return (revision, descriptors)
+  }
+
+  /// Completes only the exact inventory that was seeded. A changed revision
+  /// stays parked and tells the leader to take another serial snapshot.
+  func completeIfStable(
+    revision expectedRevision: UInt64,
+    epoch expectedEpoch: UInt64,
+    lossGeneration expectedLossGeneration: UInt64,
+    establishTracker: @Sendable () -> Void
+  ) -> Bool {
+    guard recovering,
+      recoveryEpoch == expectedEpoch,
+      recoveryLossGeneration == expectedLossGeneration,
+      knownLossGeneration == expectedLossGeneration,
+      revision == expectedRevision
+    else { return false }
+    guard !values.isEmpty else {
+      recovering = false
+      ready = false
+      return false
+    }
+    recovering = false
+    establishTracker()
+    ready = true
+    let continuations = waiters.values
+    waiters.removeAll()
+    for continuation in continuations { continuation.resume() }
+    return true
+  }
+
+  func fail(epoch expectedEpoch: UInt64?) {
+    if let expectedEpoch, expectedEpoch != recoveryEpoch { return }
+    recovering = false
+    ready = false
+    let continuations = waiters.values
+    waiters.removeAll()
+    for continuation in continuations {
+      continuation.resume(throwing: CancellationError())
+    }
+  }
+
+  func markLost(generation: UInt64) {
+    guard generation > knownLossGeneration else { return }
+    knownLossGeneration = generation
+    recoveryEpoch &+= 1
+    ready = false
+    recovering = false
+  }
+
+  func waitUntilReady() async throws {
+    guard !ready else { return }
+    let id = UUID()
+    try await withTaskCancellationHandler {
+      try await withCheckedThrowingContinuation { continuation in
+        if ready {
+          continuation.resume()
+        } else {
+          waiters[id] = continuation
+        }
+      }
+    } onCancel: {
+      Task { await self.cancelWaiter(id) }
+    }
+  }
+
+  private func cancelWaiter(_ id: UUID) {
+    guard let continuation = waiters.removeValue(forKey: id) else { return }
+    continuation.resume(throwing: CancellationError())
   }
 }
 
@@ -627,17 +747,28 @@ private final class ElectricReplicaAtomicCounter: @unchecked Sendable {
 private final class ElectricReplicaTrackerContinuity: @unchecked Sendable {
   private let lock = NSLock()
   private var established = false
+  private var generation: UInt64 = 0
 
   var isEstablished: Bool {
     lock.withLock { established }
   }
 
-  func markEstablished() {
-    lock.withLock { established = true }
+  var currentGeneration: UInt64 { lock.withLock { generation } }
+
+  func markEstablished(ifCurrent expectedGeneration: UInt64) {
+    lock.withLock {
+      guard generation == expectedGeneration else { return }
+      established = true
+    }
   }
 
-  func markLost() {
-    lock.withLock { established = false }
+  @discardableResult
+  func markLost() -> UInt64 {
+    lock.withLock {
+      generation &+= 1
+      established = false
+      return generation
+    }
   }
 }
 

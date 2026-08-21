@@ -176,9 +176,13 @@ private let electricExpectedTransportIssueSampleEvery = 20
 private let electricTransientHydrationMaxPasses = 5
 
 private func isBoundedWorkingSetDescriptor(_ descriptor: QueryDescriptor) -> Bool {
+  // A reset seed is a bounded *working-set* declaration, not a convenient
+  // spelling for an unscoped shape. A structured finite predicate is enough
+  // (for example `to_id IN <frontier>`); a limit is optional, but when a
+  // caller supplies one it must be positive.
   guard descriptor.limit.map({ $0 > 0 }) ?? true else { return false }
   guard let predicate = descriptor.predicate?.predicate else { return false }
-  if case .constant(true) = predicate { return false }
+  if case .constant(true) = predicate.normalized() { return false }
   return true
 }
 
@@ -502,6 +506,13 @@ public struct ElectricCollection<T: ElectricCollectionModel>: Sendable {
     guard replica.isAcceptingWork else {
       throw CancellationError()
     }
+    try await client.validateWorkingSetResetConfiguration(
+      T.self,
+      identity: replica.identity,
+      syncMode: configuration.syncMode,
+      shapeTopology: configuration.shapeTopology,
+      recoveryPolicy: configuration.trackerContinuityRecoveryPolicy
+    )
     let effectivePredicate = predicate ?? configuration.predicate
     let effectiveOrderBy = orderBy ?? configuration.orderBy
     let effectiveLimit = limit ?? configuration.limit
@@ -616,7 +627,27 @@ public struct ElectricCollection<T: ElectricCollectionModel>: Sendable {
     orderBy: [OrderBy] = [],
     limit: Int? = nil,
     session: ElectricSyncSession?,
-    deferWorkingSetTailReadiness: Bool = false,
+    finalizing finalize: @escaping @Sendable (ElectricSubsetResult<T>) async throws -> Void
+  ) async throws -> ElectricSubsetResult<T> {
+    try await ensureSubsetInternal(
+      where: predicate,
+      orderBy: orderBy,
+      limit: limit,
+      session: session,
+      isActiveWorkingSetRecoverySeed: false,
+      ownerPublicationAlreadyHeld: false,
+      finalizing: finalize
+    )
+  }
+
+  private func ensureSubsetInternal(
+    where predicate: SQLExpression,
+    orderBy: [OrderBy] = [],
+    limit: Int? = nil,
+    session: ElectricSyncSession?,
+    deferWorkingSetTailReadiness _: Bool = false,
+    isActiveWorkingSetRecoverySeed: Bool = false,
+    ownerPublicationAlreadyHeld: Bool = false,
     finalizing finalize: @escaping @Sendable (ElectricSubsetResult<T>) async throws -> Void
   ) async throws -> ElectricSubsetResult<T> {
     guard replica.isAcceptingWork else {
@@ -655,22 +686,63 @@ public struct ElectricCollection<T: ElectricCollectionModel>: Sendable {
       shapeTopology: configuration.shapeTopology,
       recoveryPolicy: configuration.trackerContinuityRecoveryPolicy
     )
-    let beginsWorkingSetRecovery: Bool
-    if usesConfiguredWorkingSetReset, replica.isTrackerContinuityUnavailable {
-      beginsWorkingSetRecovery = try await client.requiresFullBootstrapForTrackerContinuity(
-        T.self,
-        identity: replica.identity,
-        syncMode: ownerSyncMode,
-        shapeTopology: configuration.shapeTopology,
-        recoveryPolicy: configuration.trackerContinuityRecoveryPolicy
+    try await client.validateWorkingSetResetConfiguration(
+      T.self,
+      identity: replica.identity,
+      syncMode: ownerSyncMode,
+      shapeTopology: configuration.shapeTopology,
+      recoveryPolicy: configuration.trackerContinuityRecoveryPolicy
+    )
+    if usesConfiguredWorkingSetReset, replica.isTrackerContinuityUnavailable,
+      !isActiveWorkingSetRecoverySeed
+    {
+      // `ensureSubset` is intentionally not a recovery entry point. A
+      // one-shot read has no lifetime lease to replay after a later owner
+      // eviction, so accepting it would leave the tail either unsafe or
+      // silently historical.
+      throw ElectricSyncError.fetchFailed(
+        "exclusive working-set recovery requires activateDemand"
       )
-    } else {
-      beginsWorkingSetRecovery = false
-    }
-    if beginsWorkingSetRecovery {
-      replica.beginWorkingSetRecovery()
     }
     do {
+      let ownerOperation: @Sendable () async throws -> ElectricSubsetResult<T> = {
+        let appliedRecords = try await coordinator.performQuery(
+          client: client,
+          basePredicate: configuration.basePredicate,
+          shapeTopology: configuration.shapeTopology,
+          trackerContinuityRecoveryPolicy: configuration.trackerContinuityRecoveryPolicy,
+          descriptor: descriptor,
+          demandSyncMode: ownerSyncMode,
+          session: session,
+          snapshotReplica: replica,
+          ownerSnapshotDemand: true,
+          ownerPublicationAlreadyHeld: true,
+          consultFetchCoverage: false,
+          recordAsObservation: true,
+          transactionRunner: transactionRunner,
+          eventHandler: eventHandler
+        )
+
+        try Task.checkCancellation()
+        guard isSessionCurrent() else { throw CancellationError() }
+        let localRecords = try await cacheProvider.load(T.self, request: descriptor)
+        let observation = try await client.latestSubsetObservation(
+          table: T.tableName,
+          basePredicate: configuration.basePredicate,
+          descriptor: descriptor
+        )
+        let result = ElectricSubsetResult(
+          appliedRecords: appliedRecords,
+          // The response itself is an authoritative local view at the
+          // terminal subset boundary. Some lightweight cache providers only
+          // understand raw SQL and cannot re-evaluate a structured predicate;
+          // preserve the materialized response for route-frontier callers.
+          localRecords: localRecords.isEmpty ? appliedRecords : localRecords,
+          observation: observation
+        )
+        try await finalize(result)
+        return result
+      }
       let result = try await coordinator.performCommand {
         try await client.withLegacyBootstrapAdmission(
           identity: replica.identity,
@@ -678,41 +750,11 @@ public struct ElectricCollection<T: ElectricCollectionModel>: Sendable {
           syncMode: ownerSyncMode,
           expectsExactCursorAdvance: false
         ) {
-          try await replica.ensureSubset {
-            let appliedRecords = try await coordinator.performQuery(
-              client: client,
-              basePredicate: configuration.basePredicate,
-              shapeTopology: configuration.shapeTopology,
-              trackerContinuityRecoveryPolicy: configuration.trackerContinuityRecoveryPolicy,
-              descriptor: descriptor,
-              demandSyncMode: ownerSyncMode,
-              session: session,
-              snapshotReplica: replica,
-              ownerSnapshotDemand: true,
-              ownerPublicationAlreadyHeld: true,
-              consultFetchCoverage: false,
-              recordAsObservation: true,
-              transactionRunner: transactionRunner,
-              eventHandler: eventHandler
-            )
-
-            try Task.checkCancellation()
-            guard isSessionCurrent() else {
-              throw CancellationError()
-            }
-            let localRecords = try await cacheProvider.load(T.self, request: descriptor)
-            let observation = try await client.latestSubsetObservation(
-              table: T.tableName,
-              basePredicate: configuration.basePredicate,
-              descriptor: descriptor
-            )
-            let result = ElectricSubsetResult(
-              appliedRecords: appliedRecords,
-              localRecords: localRecords,
-              observation: observation
-            )
-            try await finalize(result)
-            return result
+          if ownerPublicationAlreadyHeld {
+            return try await ownerOperation()
+          }
+          return try await replica.ensureSubset {
+            try await ownerOperation()
           }
         }
       }
@@ -727,14 +769,8 @@ public struct ElectricCollection<T: ElectricCollectionModel>: Sendable {
           "hasObservation": "\(result.observation != nil)",
         ]) { _, new in new }
       )
-      if beginsWorkingSetRecovery && !deferWorkingSetTailReadiness {
-        replica.completeWorkingSetRecovery()
-      }
       return result
     } catch {
-      if beginsWorkingSetRecovery && !deferWorkingSetTailReadiness {
-        replica.failWorkingSetRecovery()
-      }
       let durationMs = max(0, runtimeProvider.now().timeIntervalSince(subsetStart) * 1000)
       logger.log(
         error is CancellationError ? .info : .warning,
@@ -770,9 +806,20 @@ public struct ElectricCollection<T: ElectricCollectionModel>: Sendable {
     }
     let resolvedSession = session ?? sessionProvider.captureAuthenticatedSession()
     guard let resolvedSession else { throw CancellationError() }
+    try await client.validateWorkingSetResetConfiguration(
+      T.self,
+      identity: replica.identity,
+      syncMode: configuration.syncMode,
+      shapeTopology: configuration.shapeTopology,
+      recoveryPolicy: configuration.trackerContinuityRecoveryPolicy
+    )
     let descriptor = QueryDescriptor(predicate: predicate, orderBy: orderBy, limit: limit)
-    let leaseID = replica.registerActiveDemand(descriptor)
+    // Register before the first suspension. A concurrent owner-loss recovery
+    // therefore sees this route in its replay inventory rather than treating
+    // it as an after-the-fact one-shot query.
+    let leaseID = await replica.registerActiveDemand(descriptor)
     let result: ElectricSubsetResult<T>
+    var recoveryEpoch: UInt64?
     do {
       let usesWorkingSetReset = await client.usesConfiguredOnDemandWorkingSetReset(
         T.self,
@@ -781,31 +828,40 @@ public struct ElectricCollection<T: ElectricCollectionModel>: Sendable {
         shapeTopology: configuration.shapeTopology,
         recoveryPolicy: configuration.trackerContinuityRecoveryPolicy
       )
-      let mustRecover = usesWorkingSetReset && replica.isTrackerContinuityUnavailable
+      let recoveryNeedsSeed = await replica.workingSetRecoveryNeedsSeed()
+      let mustRecover = usesWorkingSetReset && (
+        replica.isTrackerContinuityUnavailable || recoveryNeedsSeed
+      )
       if mustRecover {
-        replica.beginWorkingSetRecovery()
-        var triggeringResult: ElectricSubsetResult<T>?
-        for activeDescriptor in replica.activeDemandDescriptors(prioritizing: descriptor) {
-          guard let activePredicate = activeDescriptor.predicate,
-            isBoundedWorkingSetDescriptor(activeDescriptor)
-          else {
-            throw ElectricSyncError.fetchFailed("active working-set lease is not bounded")
-          }
-          let activeResult = try await ensureSubset(
-            where: activePredicate,
-            orderBy: activeDescriptor.orderBy,
-            limit: activeDescriptor.limit,
-            session: resolvedSession,
-            deferWorkingSetTailReadiness: true,
-            finalizing: { _ in }
+        if !replica.isTrackerContinuityUnavailable {
+          // The last lease had parked an otherwise-continuous tail. A new
+          // lease needs only its ordinary subset, not a generation reset.
+          await replica.resumeWorkingSetTailForActiveLease()
+          result = try await ensureSubset(
+            where: predicate, orderBy: orderBy, limit: limit, session: resolvedSession
           )
-          if activeDescriptor == descriptor { triggeringResult = activeResult }
+        } else if let recoveryToken = await replica.startWorkingSetRecoveryIfNeeded() {
+          recoveryEpoch = recoveryToken.epoch
+          // This is the only external recovery leader. Hold the snapshot gate
+          // across every revision pass so the canonical tail is parked once,
+          // not once per descriptor.
+          result = try await replica.ensureSubset {
+            try await recoverActiveWorkingSet(
+              session: resolvedSession,
+              prioritizing: descriptor,
+              captureResultFor: descriptor,
+              ownerPublicationAlreadyHeld: true,
+              recoveryEpoch: recoveryToken.epoch,
+              lossGeneration: recoveryToken.lossGeneration
+            )
+          }
+        } else {
+          try await replica.waitForWorkingSetTailReadiness()
+          // Another activation performed the network seed. `localRecords` is
+          // authoritative after its transaction; `appliedRecords` remains
+          // empty because this caller did not issue that response.
+          result = try await restoredLocalSubsetResult(descriptor)
         }
-        replica.completeWorkingSetRecovery()
-        guard let triggeringResult else {
-          throw ElectricSyncError.fetchFailed("triggering working-set demand was not replayed")
-        }
-        result = triggeringResult
       } else {
         result = try await ensureSubset(
           where: predicate,
@@ -815,7 +871,7 @@ public struct ElectricCollection<T: ElectricCollectionModel>: Sendable {
         )
       }
     } catch {
-      replica.failWorkingSetRecovery()
+      if let recoveryEpoch { replica.failWorkingSetRecovery(epoch: recoveryEpoch) }
       replica.releaseActiveDemand(leaseID)
       throw error
     }
@@ -825,6 +881,87 @@ public struct ElectricCollection<T: ElectricCollectionModel>: Sendable {
       streamToken.cancel()
     })
     return ElectricSubsetDemandActivation(lease: lease, result: result)
+  }
+
+  /// Seeds stable snapshots of the actor-owned lease inventory. The caller
+  /// chooses whether it already owns the stream publication gate; this is the
+  /// key distinction between an external activation (snapshot gate) and a
+  /// running tail after owner loss (stream gate), avoiding self-pause.
+  private func recoverActiveWorkingSet(
+    session: ElectricSyncSession?,
+    prioritizing descriptor: QueryDescriptor? = nil,
+    captureResultFor capturedDescriptor: QueryDescriptor? = nil,
+    ownerPublicationAlreadyHeld: Bool,
+    recoveryEpoch: UInt64,
+    lossGeneration: UInt64
+  ) async throws -> ElectricSubsetResult<T> {
+    var capturedResult: ElectricSubsetResult<T>?
+    var seededDescriptors = Set<QueryDescriptor>()
+    while true {
+      guard await replica.isWorkingSetRecoveryCurrent(
+        epoch: recoveryEpoch,
+        lossGeneration: lossGeneration
+      ) else {
+        throw CancellationError()
+      }
+      let snapshot = await replica.workingSetRecoverySnapshot(prioritizing: descriptor)
+      guard !snapshot.descriptors.isEmpty else {
+        throw CancellationError()
+      }
+      for activeDescriptor in snapshot.descriptors {
+        guard seededDescriptors.insert(activeDescriptor).inserted else { continue }
+        guard let activePredicate = activeDescriptor.predicate,
+          isBoundedWorkingSetDescriptor(activeDescriptor)
+        else {
+          throw ElectricSyncError.fetchFailed("active working-set lease is not bounded")
+        }
+        let activeResult = try await ensureSubsetInternal(
+          where: activePredicate,
+          orderBy: activeDescriptor.orderBy,
+          limit: activeDescriptor.limit,
+          session: session,
+          deferWorkingSetTailReadiness: true,
+          isActiveWorkingSetRecoverySeed: true,
+          ownerPublicationAlreadyHeld: ownerPublicationAlreadyHeld,
+          finalizing: { _ in }
+        )
+        if activeDescriptor == capturedDescriptor { capturedResult = activeResult }
+      }
+      // Perform any throw-capable cache reconciliation while the epoch is
+      // still parked. Once completion resumes the tail, this function must
+      // not be able to invalidate an already-established generation.
+      let finalResult: ElectricSubsetResult<T>
+      if let capturedResult {
+        finalResult = capturedResult
+      } else {
+        finalResult = try await restoredLocalSubsetResult(
+          capturedDescriptor ?? snapshot.descriptors[0]
+        )
+      }
+      if await replica.completeWorkingSetRecoveryIfStable(
+        revision: snapshot.revision,
+        epoch: recoveryEpoch,
+        lossGeneration: lossGeneration
+      ) {
+        return finalResult
+      }
+      // A lease appeared/disappeared while the prior inventory was being
+      // seeded. It is intentionally replayed before the tail is released.
+    }
+  }
+
+  private func restoredLocalSubsetResult(_ descriptor: QueryDescriptor) async throws -> ElectricSubsetResult<T> {
+    let localRecords = try await cacheProvider.load(T.self, request: descriptor)
+    let observation = try await client.latestSubsetObservation(
+      table: T.tableName,
+      basePredicate: configuration.basePredicate,
+      descriptor: descriptor
+    )
+    return ElectricSubsetResult(
+      appliedRecords: [],
+      localRecords: localRecords,
+      observation: observation
+    )
   }
 
   /// Returns an AsyncStream that keeps the collection in sync by repeatedly issuing queries.
@@ -907,6 +1044,22 @@ public struct ElectricCollection<T: ElectricCollectionModel>: Sendable {
         let isSessionCurrent: @Sendable () -> Bool = {
           guard let session else { return false }
           return sessionProvider.isCurrent(session)
+        }
+        do {
+          try await client.validateWorkingSetResetConfiguration(
+            T.self,
+            identity: replica.identity,
+            syncMode: streamSyncMode,
+            shapeTopology: configuration.shapeTopology,
+            recoveryPolicy: configuration.trackerContinuityRecoveryPolicy
+          )
+        } catch {
+          logger.log(
+            .warning,
+            message: "Electric stream rejected invalid working-set recovery configuration",
+            metadata: ["table": T.tableName, "collection": collectionIdentifier, "error": "\(error)"]
+          )
+          return
         }
 
         var breaker = breakerSeed
@@ -1357,32 +1510,30 @@ public struct ElectricCollection<T: ElectricCollectionModel>: Sendable {
             break
           }
 
-          if usesConfiguredWorkingSetReset && !replica.isWorkingSetTailReady {
-            let activeDemands = replica.activeDemandDescriptors()
-            if activeDemands.isEmpty {
-              try await replica.waitForWorkingSetTailReadiness()
+          let isWorkingSetTailReady = await replica.isWorkingSetTailReady
+          if usesConfiguredWorkingSetReset && (replica.isTrackerContinuityUnavailable || !isWorkingSetTailReady) {
+            if let recoveryToken = await replica.startWorkingSetRecoveryIfNeeded() {
+              do {
+                // We already own the stream publication gate in this task;
+                // seed through the same core without pausing this controller.
+                _ = try await replica.withStreamPublication {
+                  try await recoverActiveWorkingSet(
+                    session: session,
+                    ownerPublicationAlreadyHeld: true,
+                    recoveryEpoch: recoveryToken.epoch,
+                    lossGeneration: recoveryToken.lossGeneration
+                  )
+                }
+              } catch {
+                replica.failWorkingSetRecovery(epoch: recoveryToken.epoch)
+                throw error
+              }
               continue
             }
-            replica.beginWorkingSetRecovery()
-            do {
-              for descriptor in activeDemands {
-                guard let predicate = descriptor.predicate else {
-                  throw ElectricSyncError.fetchFailed("working-set demand must include a predicate")
-                }
-                _ = try await ensureSubset(
-                  where: predicate,
-                  orderBy: descriptor.orderBy,
-                  limit: descriptor.limit,
-                  session: session,
-                  deferWorkingSetTailReadiness: true,
-                  finalizing: { _ in }
-                )
-              }
-              replica.completeWorkingSetRecovery()
-            } catch {
-              replica.failWorkingSetRecovery()
-              throw error
-            }
+            // With no leases the actor refuses leadership. A cancellation of
+            // this parked tail is observable, so activation can cancel/reseed
+            // it without the historic readiness deadlock.
+            try await replica.waitForWorkingSetTailReadiness()
             continue
           }
 

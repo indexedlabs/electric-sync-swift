@@ -4,6 +4,11 @@ import Foundation
 /// Calls are synchronous; implementations may optionally honor an opaque transaction context.
 public protocol MetadataProvider: Sendable {
   var supportsDurableRowOwnership: Bool { get }
+  /// Whether this provider can atomically clear every ownership/tag/deferred
+  /// delete record with the exclusive local table and cursor replacement.
+  /// Durable ownership alone is not sufficient to opt into DNF working-set
+  /// recovery.
+  var supportsExclusiveWorkingSetReset: Bool { get }
 
   func hasFetched(table: String, predicate: PredicateHash, transaction: Any?) throws -> Bool
   func getFetchedPredicates(table: String, transaction: Any?) throws -> [FetchedPredicate]
@@ -139,6 +144,7 @@ public protocol MetadataProvider: Sendable {
 
 extension MetadataProvider {
   public var supportsDurableRowOwnership: Bool { false }
+  public var supportsExclusiveWorkingSetReset: Bool { false }
 
   public func recordFetch(
     table: String,
