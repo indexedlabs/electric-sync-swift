@@ -2012,6 +2012,88 @@ struct ElectricReplicaOwnerLifecycleTests {
   }
 
   @Test
+  func staleWorkingSetGenerationReturnsTypedCompletionInsteadOfCancellation() async throws {
+    let harness = ReplicaHarness<ReplicaTestRecord>(
+      responses: [],
+      syncMode: .onDemand,
+      protocolCapabilityPolicy: .enabled,
+      shapeTopology: .dnf,
+      trackerContinuityRecoveryPolicy: .replaceExclusiveWorkingSetFromDemandedSubsets
+    )
+    let descriptor = QueryDescriptor(
+      predicate: SQLExpression(predicate: .equals(field: "id", value: .string("seed")))
+    )
+    let leaseID = await harness.collection.replica.registerActiveDemand(descriptor)
+    defer { harness.collection.replica.releaseActiveDemand(leaseID) }
+    let token = try #require(await harness.collection.replica.startWorkingSetRecoveryIfNeeded())
+    let snapshot = await harness.collection.replica.workingSetRecoverySnapshot()
+
+    // This is the narrow generation race: loss wins after the stable inventory
+    // snapshot but before completion. The actor must report stale generation,
+    // which recoverActiveWorkingSet maps to ElectricWorkingSetRecoveryRetry
+    // rather than CancellationError (so activateDemand retains its lease).
+    await harness.collection.replica.invalidateWorkingSetTracker()
+    let completion = await harness.collection.replica.completeWorkingSetRecoveryIfStable(
+      revision: snapshot.revision,
+      epoch: token.epoch,
+      lossGeneration: token.lossGeneration
+    )
+    #expect(completion == .staleGeneration)
+    #expect(
+      await harness.collection.replica.activeDemandDescriptors() == [descriptor]
+    )
+  }
+
+  @Test
+  func returnedLeaseCancellationFencesRetainedRawTailDuringRecovery() async throws {
+    let sessionController = TestSessionController()
+    let seed = ReplicaTestRecord(id: "seed", name: "Seed")
+    let reseeded = ReplicaTestRecord(id: "seed", name: "Reseeded")
+    let harness = ReplicaHarness<ReplicaTestRecord>(
+      responses: [
+        [
+          ElectricMessage.replicaRecord(seed, offset: "seed-offset", tags: ["shape"], isSubsetSnapshot: true),
+          ElectricMessage.replicaSubsetEnd(offset: "seed-offset"),
+        ],
+        [ElectricMessage.replicaUpToDate(offset: "tail-before-loss")],
+        [
+          ElectricMessage.replicaRecord(
+            reseeded, offset: "reseed-offset", tags: ["shape"], isSubsetSnapshot: true
+          ),
+          ElectricMessage.replicaSubsetEnd(offset: "reseed-offset"),
+        ],
+      ],
+      syncMode: .onDemand,
+      isExactCursorCutoverEnabled: true,
+      blocksRequestIndexUntilResumed: 3,
+      protocolCapabilityPolicy: .enabled,
+      shapeTopology: .dnf,
+      trackerContinuityRecoveryPolicy: .replaceExclusiveWorkingSetFromDemandedSubsets
+    )
+    let session = try #require(sessionController.captureAuthenticatedSession())
+    // This token survives the returned activation lease. It proves the
+    // zero-demand fence rather than merely cancellation of the lease's own
+    // keepSynced token.
+    let rawToken = harness.collection.keepSynced(session: session)
+    defer { rawToken.cancel() }
+
+    let activation = try await harness.collection.activateDemand(
+      where: SQLExpression(predicate: .equals(field: "id", value: .string("seed"))), session: session
+    )
+    try await waitUntilTrueAsync { await harness.http.requestCount() >= 2 }
+    await harness.collection.replica.invalidateWorkingSetTracker()
+    try await waitUntilTrueAsync { await harness.http.requestCount() == 3 }
+
+    activation.lease.cancel()
+    await harness.http.resumeBlockedFetch()
+    for _ in 0..<20 { await Task.yield() }
+
+    #expect(await harness.http.requestCount() == 3)
+    let requests = await harness.http.capturedRequests()
+    #expect(!requests.contains { $0.offset == "-1" })
+  }
+
+  @Test
   func taggedTailTrackerLossReplaysActiveLeaseWithoutFullBootstrap() async throws {
     let sessionController = TestSessionController()
     let seed = ReplicaTestRecord(id: "seed", name: "Seed")
@@ -2182,6 +2264,118 @@ struct ElectricReplicaOwnerLifecycleTests {
       #expect(requests[1].subset != nil)
       #expect(requests[1].log == .changesOnly)
     }
+  }
+
+  @Test
+  func forcedFullBootstrapAppliesDNFBaselineInsteadOfLocalTrackerLoss() async throws {
+    let baseline = ReplicaTestRecord(id: "baseline", name: "Baseline")
+    let harness = ReplicaHarness<ReplicaTestRecord>(
+      responses: [[
+        ElectricMessage.replicaRecord(baseline, offset: "baseline-offset", tags: ["shape"]),
+        ElectricMessage.replicaUpToDate(offset: "baseline-offset"),
+      ]],
+      syncMode: .onDemand,
+      legacyBootstrapAdmissionController: ElectricLegacyBootstrapAdmissionController(enabled: true),
+      protocolCapabilityPolicy: .enabled,
+      shapeTopology: .dnf,
+      trackerContinuityRecoveryPolicy: .replaceExclusiveWorkingSetFromDemandedSubsets
+    )
+    let replica = harness.collection.replica
+    let stateKey = replica.identity.legacyPersistedCursorKey(syncMode: .onDemand)
+    try harness.metadata.updateSyncState(
+      collectionId: stateKey,
+      state: SyncState(
+        offset: "resumed-offset",
+        handle: "resumed-handle",
+        cursor: "resumed-cursor",
+        isUpToDate: true,
+        lastSyncedAt: Date(),
+        protocolSemanticEpoch: .taggedShape1_7_7
+      ),
+      transaction: nil
+    )
+    await harness.client.invalidateProcessLocalTracker(
+      identity: replica.identity,
+      syncMode: .onDemand
+    )
+
+    let batch = try #require(
+      try await harness.client.withLegacyBootstrapAdmission(
+        identity: replica.identity,
+        stage: "forced_dnf_baseline_test",
+        syncMode: .onDemand
+      ) {
+        try await harness.client.pollStream(
+          ReplicaTestRecord.self,
+          basePredicate: nil,
+          shapeTopology: .dnf,
+          syncMode: .onDemand,
+          live: false,
+          forceFullBootstrap: true,
+          replicaIdentity: replica.identity
+        )
+      }
+    )
+    let request = try #require(await harness.http.capturedRequests().first)
+    #expect(request.offset == "-1")
+    #expect(request.log == nil)
+    let output = try batch.apply(in: harness.store)
+    #expect(!output.encounteredTruncate)
+    #expect(output.recoveryCause == nil)
+    #expect(harness.store.storedIDs() == [baseline.id])
+    #expect(
+      try harness.metadata.getSyncState(
+        collectionId: stateKey,
+        transaction: nil
+      )?.offset == "baseline-offset"
+    )
+  }
+
+  @Test
+  func wireTruncateOutranksLostDNFTrackerClassification() async throws {
+    let tagged = ReplicaTestRecord(id: "tagged", name: "Tagged")
+    let harness = ReplicaHarness<ReplicaTestRecord>(
+      responses: [[
+        ElectricMessage.replicaRecord(tagged, offset: "tagged-offset", tags: ["shape"]),
+        ElectricMessage.replicaTruncate(),
+      ]],
+      syncMode: .onDemand,
+      legacyBootstrapAdmissionController: ElectricLegacyBootstrapAdmissionController(enabled: true),
+      protocolCapabilityPolicy: .enabled,
+      shapeTopology: .dnf,
+      trackerContinuityRecoveryPolicy: .replaceExclusiveWorkingSetFromDemandedSubsets
+    )
+    let replica = harness.collection.replica
+    let stateKey = replica.identity.legacyPersistedCursorKey(syncMode: .onDemand)
+    try harness.metadata.updateSyncState(
+      collectionId: stateKey,
+      state: SyncState(
+        offset: "resumed-offset",
+        handle: "resumed-handle",
+        cursor: "resumed-cursor",
+        isUpToDate: true,
+        lastSyncedAt: Date(),
+        protocolSemanticEpoch: .taggedShape1_7_7
+      ),
+      transaction: nil
+    )
+    await harness.client.invalidateProcessLocalTracker(
+      identity: replica.identity,
+      syncMode: .onDemand
+    )
+    let batch = try #require(
+      try await harness.client.pollStream(
+        ReplicaTestRecord.self,
+        basePredicate: nil,
+        shapeTopology: .dnf,
+        syncMode: .onDemand,
+        live: false,
+        replicaIdentity: replica.identity
+      )
+    )
+    let output = try batch.apply(in: harness.store)
+    #expect(output.encounteredTruncate)
+    #expect(output.recoveryCause == nil)
   }
 
   /// The tagged-shape capability gate alone requires process-local tracker
@@ -2817,6 +3011,27 @@ struct ElectricReplicaOwnerLifecycleTests {
         transactionGate: transactionGate
       )
       harness.store.upsert(id: "existing", name: "Existing generation")
+      let preservedPredicate = PredicateHash(value: "preserved-coverage")
+      transactionGate.beforeBlockedOperation {
+        harness.metadata.seedFetched(table: ReplicaTestRecord.tableName, predicate: preservedPredicate)
+        harness.metadata.seedOwnedRow(table: ReplicaTestRecord.tableName, rowKey: "existing")
+        harness.metadata.seedOwnershipTags(
+          table: ReplicaTestRecord.tableName,
+          rowKey: "existing",
+          tags: ["preserved-tag"]
+        )
+        try? harness.metadata.updateSyncState(
+          collectionId: harness.collection.replica.identity.persistedCursorKey,
+          state: SyncState(
+            offset: "preserved-cursor",
+            handle: "preserved-handle",
+            cursor: "cursor",
+            isUpToDate: true,
+            lastSyncedAt: Date()
+          ),
+          transaction: nil
+        )
+      }
 
       let queryTask = Task {
         try await harness.collection.query(where: SQLExpression("id IS NOT NULL"))
@@ -2835,6 +3050,24 @@ struct ElectricReplicaOwnerLifecycleTests {
       } catch {
         #expect(harness.collection.replica.ownerState == .dormant)
         #expect(harness.store.storedIDs() == ["existing"])
+        #expect(
+          try harness.metadata.hasFetched(
+            table: ReplicaTestRecord.tableName,
+            predicate: preservedPredicate,
+            transaction: nil
+          )
+        )
+        #expect(
+          try harness.metadata.getSyncState(
+            collectionId: harness.collection.replica.identity.persistedCursorKey,
+            transaction: nil
+          )?.offset == "preserved-cursor"
+        )
+        #expect(
+          harness.metadata.ownershipTags(table: ReplicaTestRecord.tableName) == [
+            "existing": ["preserved-tag"]
+          ]
+        )
       }
     }
   }
@@ -2882,6 +3115,7 @@ private final class ReplicaHarness<Model: ElectricCollectionModel>: @unchecked S
       pristineOwnerAdmissionError: pristineOwnerAdmissionError,
       pristineOwnerAdmissionResults: pristineOwnerAdmissionResults
     )
+    let metadata = self.metadata
     let http = ReplicaInMemoryHTTPClientProvider(
       responses: responses,
       blocksFirstFetchUntilResumed: blocksFirstFetchUntilResumed,
@@ -2922,9 +3156,16 @@ private final class ReplicaHarness<Model: ElectricCollectionModel>: @unchecked S
       transactionRunner: { operation in
         try await transactionGate?.beforeOperation()
         let transactionStore = store.transactionCopy()
-        try operation(transactionStore)
+        let transactionMetadata = metadata.transactionStorageCopy()
+        try operation(
+          ReplicaTransactionContext(
+            recordStore: transactionStore,
+            metadataStorage: transactionMetadata
+          )
+        )
         try await transactionGate?.afterOperation()
         store.replaceContents(with: transactionStore)
+        metadata.replaceTransactionStorage(transactionMetadata)
       },
       gcTime: gcTime
     )
@@ -2999,7 +3240,8 @@ extension ReplicaLifecycleTestModel {
         missingRowKeys: [message.key].compactMap { $0 }
       )
     }
-    (transaction as? ReplicaTestRecordStore)?.upsert(
+    ((transaction as? ReplicaTransactionContext)?.recordStore
+      ?? transaction as? ReplicaTestRecordStore)?.upsert(
       id: record.id,
       name: record.name,
       enrichment: record.enrichment
@@ -3016,11 +3258,13 @@ extension ReplicaLifecycleTestModel {
   }
 
   static func truncate(transaction: Any?) throws {
-    (transaction as? ReplicaTestRecordStore)?.clear()
+    ((transaction as? ReplicaTransactionContext)?.recordStore
+      ?? transaction as? ReplicaTestRecordStore)?.clear()
   }
 
   static func deleteByKey(_ key: String, transaction: Any?) throws {
-    (transaction as? ReplicaTestRecordStore)?.delete(id: key)
+    ((transaction as? ReplicaTransactionContext)?.recordStore
+      ?? transaction as? ReplicaTestRecordStore)?.delete(id: key)
   }
 }
 
@@ -3303,6 +3547,7 @@ private final class ReplicaTransactionGate: @unchecked Sendable {
   private var invocationCount = 0
   private var releaseRequested = false
   private var continuation: CheckedContinuation<Void, Never>?
+  private var beforeBlockedOperationAction: (@Sendable () -> Void)?
 
   init(
     blockedInvocation: Int,
@@ -3319,7 +3564,12 @@ private final class ReplicaTransactionGate: @unchecked Sendable {
       invocationCount += 1
       return invocationCount
     }
-    guard !blocksAfterOperation, invocation == blockedInvocation else { return }
+    if blocksAfterOperation, invocation == blockedInvocation {
+      let action = lock.withLock { beforeBlockedOperationAction }
+      action?()
+      return
+    }
+    guard invocation == blockedInvocation else { return }
 
     try await waitAndMaybeFail()
   }
@@ -3353,6 +3603,10 @@ private final class ReplicaTransactionGate: @unchecked Sendable {
     lock.withLock { invocationCount >= blockedInvocation }
   }
 
+  func beforeBlockedOperation(_ action: @escaping @Sendable () -> Void) {
+    lock.withLock { beforeBlockedOperationAction = action }
+  }
+
   func release() {
     let continuation = lock.withLock {
       releaseRequested = true
@@ -3376,6 +3630,48 @@ private struct ReplicaProtocolRecoveryError: ElectricProtocolIncompatibilityErro
     detail: "simulated protocol recovery error",
     compatibilityMayChangeAfterFullBootstrap: true
   )
+}
+
+private final class ReplicaMetadataStorage: @unchecked Sendable {
+  let lock = NSLock()
+  var fetched: [String: [PredicateHash: FetchedPredicate]] = [:]
+  var ranges: [String: [String: [FetchedRange]]] = [:]
+  var syncStates: [String: SyncState] = [:]
+  var ownedRowKeys: [String: Set<String>] = [:]
+  var ownershipTags: [String: [String: [String]]] = [:]
+
+  func copy() -> ReplicaMetadataStorage {
+    let result = ReplicaMetadataStorage()
+    lock.withLock {
+      result.fetched = fetched
+      result.ranges = ranges
+      result.syncStates = syncStates
+      result.ownedRowKeys = ownedRowKeys
+      result.ownershipTags = ownershipTags
+    }
+    return result
+  }
+
+  func replaceContents(with other: ReplicaMetadataStorage) {
+    let copied = other.copy()
+    lock.withLock {
+      fetched = copied.fetched
+      ranges = copied.ranges
+      syncStates = copied.syncStates
+      ownedRowKeys = copied.ownedRowKeys
+      ownershipTags = copied.ownershipTags
+    }
+  }
+}
+
+private final class ReplicaTransactionContext: @unchecked Sendable {
+  let recordStore: ReplicaTestRecordStore
+  let metadataStorage: ReplicaMetadataStorage
+
+  init(recordStore: ReplicaTestRecordStore, metadataStorage: ReplicaMetadataStorage) {
+    self.recordStore = recordStore
+    self.metadataStorage = metadataStorage
+  }
 }
 
 private final class ReplicaInMemoryMetadataProvider: MetadataProvider, @unchecked Sendable {
@@ -3411,10 +3707,16 @@ private final class ReplicaInMemoryMetadataProvider: MetadataProvider, @unchecke
   }
 
   private let lock = NSLock()
-  private var fetched: [String: [PredicateHash: FetchedPredicate]] = [:]
-  private var ranges: [String: [String: [FetchedRange]]] = [:]
-  private var syncStates: [String: SyncState] = [:]
-  private var ownedRowKeys: [String: Set<String>] = [:]
+  private let storage = ReplicaMetadataStorage()
+
+  private func storage(for transaction: Any?) -> ReplicaMetadataStorage {
+    (transaction as? ReplicaTransactionContext)?.metadataStorage ?? storage
+  }
+
+  func transactionStorageCopy() -> ReplicaMetadataStorage { storage.copy() }
+  func replaceTransactionStorage(_ transactionStorage: ReplicaMetadataStorage) {
+    storage.replaceContents(with: transactionStorage)
+  }
 
   func afterNextPristineOwnerAdmission(_ action: @escaping @Sendable () -> Void) {
     lock.withLock {
@@ -3423,8 +3725,8 @@ private final class ReplicaInMemoryMetadataProvider: MetadataProvider, @unchecke
   }
 
   func seedFetched(table: String, predicate: PredicateHash) {
-    lock.withLock {
-      var tablePredicates = fetched[table] ?? [:]
+    storage.lock.withLock {
+      var tablePredicates = storage.fetched[table] ?? [:]
       tablePredicates[predicate] = FetchedPredicate(
         predicateHash: predicate,
         predicateJSON: nil,
@@ -3433,22 +3735,34 @@ private final class ReplicaInMemoryMetadataProvider: MetadataProvider, @unchecke
         isComplete: true,
         fetchedAt: Date()
       )
-      fetched[table] = tablePredicates
+      storage.fetched[table] = tablePredicates
     }
   }
 
   func seedOwnedRow(table: String, rowKey: String) {
-    _ = lock.withLock {
-      ownedRowKeys[table, default: []].insert(rowKey)
+    _ = storage.lock.withLock {
+      storage.ownedRowKeys[table, default: []].insert(rowKey)
     }
   }
 
-  func hasFetched(table: String, predicate: PredicateHash, transaction _: Any?) throws -> Bool {
-    lock.withLock { fetched[table]?[predicate]?.isComplete == true }
+  func seedOwnershipTags(table: String, rowKey: String, tags: [String]) {
+    storage.lock.withLock {
+      storage.ownershipTags[table, default: [:]][rowKey] = tags
+    }
   }
 
-  func getFetchedPredicates(table: String, transaction _: Any?) throws -> [FetchedPredicate] {
-    lock.withLock { fetched[table].map { Array($0.values) } ?? [] }
+  func ownershipTags(table: String) -> [String: [String]] {
+    storage.lock.withLock { storage.ownershipTags[table] ?? [:] }
+  }
+
+  func hasFetched(table: String, predicate: PredicateHash, transaction: Any?) throws -> Bool {
+    let storage = storage(for: transaction)
+    return storage.lock.withLock { storage.fetched[table]?[predicate]?.isComplete == true }
+  }
+
+  func getFetchedPredicates(table: String, transaction: Any?) throws -> [FetchedPredicate] {
+    let storage = storage(for: transaction)
+    return storage.lock.withLock { storage.fetched[table].map { Array($0.values) } ?? [] }
   }
 
   func recordFetch(
@@ -3458,10 +3772,11 @@ private final class ReplicaInMemoryMetadataProvider: MetadataProvider, @unchecke
     snapshotBoundary: PostgresSnapshot?,
     outcome: SubsetObservationOutcome,
     isComplete: Bool,
-    transaction _: Any?
+    transaction: Any?
   ) throws {
-    lock.withLock {
-      var tablePredicates = fetched[table] ?? [:]
+    let storage = storage(for: transaction)
+    storage.lock.withLock {
+      var tablePredicates = storage.fetched[table] ?? [:]
       tablePredicates[predicate] = FetchedPredicate(
         predicateHash: predicate,
         predicateJSON: predicateJSON,
@@ -3470,58 +3785,96 @@ private final class ReplicaInMemoryMetadataProvider: MetadataProvider, @unchecke
         isComplete: isComplete,
         fetchedAt: Date()
       )
-      fetched[table] = tablePredicates
+      storage.fetched[table] = tablePredicates
     }
   }
 
-  func getFetchedRanges(table: String, orderField: String, transaction _: Any?) throws
+  func getFetchedRanges(table: String, orderField: String, transaction: Any?) throws
     -> [FetchedRange]
   {
-    lock.withLock { ranges[table]?[orderField] ?? [] }
+    let storage = storage(for: transaction)
+    return storage.lock.withLock { storage.ranges[table]?[orderField] ?? [] }
   }
 
   func recordRange(
     table: String,
     orderField: String,
     range: FetchedRange,
-    transaction _: Any?
+    transaction: Any?
   ) throws {
-    lock.withLock {
-      var tableRanges = ranges[table] ?? [:]
+    let storage = storage(for: transaction)
+    storage.lock.withLock {
+      var tableRanges = storage.ranges[table] ?? [:]
       tableRanges[orderField, default: []].append(range)
-      ranges[table] = tableRanges
+      storage.ranges[table] = tableRanges
     }
   }
 
-  func clearMetadata(table: String, transaction _: Any?) throws {
-    lock.withLock {
-      fetched[table] = nil
-      ranges[table] = nil
+  func clearMetadata(table: String, transaction: Any?) throws {
+    let storage = storage(for: transaction)
+    storage.lock.withLock {
+      storage.fetched[table] = nil
+      storage.ranges[table] = nil
     }
   }
 
-  func getSyncState(collectionId: String, transaction _: Any?) throws -> SyncState? {
-    lock.withLock { syncStates[collectionId] }
+  func getSyncState(collectionId: String, transaction: Any?) throws -> SyncState? {
+    let storage = storage(for: transaction)
+    return storage.lock.withLock { storage.syncStates[collectionId] }
   }
 
-  func updateSyncState(collectionId: String, state: SyncState, transaction _: Any?) throws {
-    lock.withLock { syncStates[collectionId] = state }
+  func updateSyncState(collectionId: String, state: SyncState, transaction: Any?) throws {
+    let storage = storage(for: transaction)
+    storage.lock.withLock { storage.syncStates[collectionId] = state }
   }
 
   func releaseAllRowOwnership(
     table: String,
     shapeIdentity _: String,
-    transaction _: Any?
+    transaction: Any?
   ) throws -> [String] {
-    lock.withLock {
-      defer { ownedRowKeys[table] = nil }
-      return Array(ownedRowKeys[table] ?? []).sorted()
+    let storage = storage(for: transaction)
+    return storage.lock.withLock {
+      defer { storage.ownedRowKeys[table] = nil }
+      return Array(storage.ownedRowKeys[table] ?? []).sorted()
     }
   }
 
-  func clearExclusiveWorkingSetOwnership(table: String, transaction _: Any?) throws {
-    lock.withLock {
-      ownedRowKeys[table] = nil
+  func clearExclusiveWorkingSetOwnership(table: String, transaction: Any?) throws {
+    let storage = storage(for: transaction)
+    storage.lock.withLock {
+      storage.ownedRowKeys[table] = nil
+      storage.ownershipTags[table] = nil
+    }
+  }
+
+  func getRowOwnershipTags(
+    table: String,
+    shapeIdentity _: String,
+    rowKeys: Set<String>?,
+    transaction: Any?
+  ) throws -> [String: [String]] {
+    let storage = storage(for: transaction)
+    return storage.lock.withLock {
+      let tags = storage.ownershipTags[table] ?? [:]
+      guard let rowKeys else { return tags }
+      return tags.filter { rowKeys.contains($0.key) }
+    }
+  }
+
+  func updateRowOwnership(
+    table: String,
+    shapeIdentity _: String,
+    tagsByRowKey: [String: [String]],
+    removedRowKeys: Set<String>,
+    transaction: Any?
+  ) throws {
+    let storage = storage(for: transaction)
+    storage.lock.withLock {
+      var tags = storage.ownershipTags[table] ?? [:]
+      for rowKey in removedRowKeys { tags[rowKey] = nil }
+      for (rowKey, values) in tagsByRowKey { tags[rowKey] = values }
+      storage.ownershipTags[table] = tags
     }
   }
 
