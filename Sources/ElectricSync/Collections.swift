@@ -410,6 +410,12 @@ public struct ElectricCollection<T: ElectricCollectionModel>: Sendable {
     tracer
   }
 
+  /// Internal test seam for joining a coalesced query before releasing the
+  /// leader's transport. It is never installed by production callers.
+  internal func setInflightQueryMatchTestHook(_ hook: (@Sendable () -> Void)?) async {
+    await coordinator.setInflightQueryMatchTestHook(hook)
+  }
+
   public init(
     configuration: ElectricCollectionConfiguration<T>,
     client: ElectricSyncClientImpl,
@@ -836,9 +842,12 @@ public struct ElectricCollection<T: ElectricCollectionModel>: Sendable {
     limit: Int? = nil,
     session: ElectricSyncSession? = nil
   ) async throws -> ElectricSubsetDemandActivation<T> {
-    guard isBoundedWorkingSetDescriptor(
-      QueryDescriptor(predicate: predicate, orderBy: orderBy, limit: limit)
-    ) else {
+    try Task.checkCancellation()
+    guard
+      isBoundedWorkingSetDescriptor(
+        QueryDescriptor(predicate: predicate, orderBy: orderBy, limit: limit)
+      )
+    else {
       throw ElectricSyncError.fetchFailed("working-set demand must be bounded")
     }
     let resolvedSession = session ?? sessionProvider.captureAuthenticatedSession()
@@ -850,15 +859,17 @@ public struct ElectricCollection<T: ElectricCollectionModel>: Sendable {
       shapeTopology: configuration.shapeTopology,
       recoveryPolicy: configuration.trackerContinuityRecoveryPolicy
     )
+    try Task.checkCancellation()
     let descriptor = QueryDescriptor(predicate: predicate, orderBy: orderBy, limit: limit)
-    // Register before the first suspension. A concurrent owner-loss recovery
-    // therefore sees this route in its replay inventory rather than treating
-    // it as an after-the-fact one-shot query.
-    let leaseID = await replica.registerActiveDemand(descriptor)
+    // Registration synchronously inventories this descriptor before it becomes
+    // tail-eligible, so concurrent owner-loss recovery replays the canonical
+    // lease set without letting a provisional cancellation open the raw tail.
+    let leaseID = try await replica.registerActiveDemand(descriptor)
     var resolvedResult: ElectricSubsetResult<T>?
     var recoveryEpoch: UInt64?
     do {
       while resolvedResult == nil {
+        try Task.checkCancellation()
         do {
           let usesWorkingSetReset = await client.usesConfiguredOnDemandWorkingSetReset(
             T.self,
@@ -868,9 +879,8 @@ public struct ElectricCollection<T: ElectricCollectionModel>: Sendable {
             recoveryPolicy: configuration.trackerContinuityRecoveryPolicy
           )
           let recoveryNeedsSeed = await replica.workingSetRecoveryNeedsSeed()
-          let mustRecover = usesWorkingSetReset && (
-            replica.isTrackerContinuityUnavailable || recoveryNeedsSeed
-          )
+          let mustRecover =
+            usesWorkingSetReset && (replica.isTrackerContinuityUnavailable || recoveryNeedsSeed)
           if mustRecover {
             if let recoveryToken = await replica.startWorkingSetRecoveryIfNeeded() {
               recoveryEpoch = recoveryToken.epoch
@@ -929,7 +939,7 @@ public struct ElectricCollection<T: ElectricCollectionModel>: Sendable {
     }
   }
 
-  /// Seeds stable snapshots of the actor-owned lease inventory. The caller
+  /// Seeds stable snapshots of the synchronous lease inventory. The caller
   /// chooses whether it already owns the stream publication gate; this is the
   /// key distinction between an external activation (snapshot gate) and a
   /// running tail after owner loss (stream gate), avoiding self-pause.
@@ -945,10 +955,12 @@ public struct ElectricCollection<T: ElectricCollectionModel>: Sendable {
     var seededDescriptors = Set<QueryDescriptor>()
     var preparedTrackerForEpoch = false
     while true {
-      guard await replica.isWorkingSetRecoveryCurrent(
-        epoch: recoveryEpoch,
-        lossGeneration: lossGeneration
-      ) else {
+      guard
+        await replica.isWorkingSetRecoveryCurrent(
+          epoch: recoveryEpoch,
+          lossGeneration: lossGeneration
+        )
+      else {
         // This leader lost its epoch after capturing the inventory. Preserve
         // the activating lease and let activateDemand re-contend rather than
         // treating it as caller cancellation and releasing that lease.
@@ -966,10 +978,12 @@ public struct ElectricCollection<T: ElectricCollectionModel>: Sendable {
           throw ElectricSyncError.fetchFailed("active working-set lease is not bounded")
         }
         if !preparedTrackerForEpoch {
-          guard await replica.prepareWorkingSetRecoverySeed(
-            epoch: recoveryEpoch,
-            lossGeneration: lossGeneration
-          ) else {
+          guard
+            await replica.prepareWorkingSetRecoverySeed(
+              epoch: recoveryEpoch,
+              lossGeneration: lossGeneration
+            )
+          else {
             throw ElectricWorkingSetRecoveryRetry()
           }
           preparedTrackerForEpoch = true
@@ -1015,7 +1029,9 @@ public struct ElectricCollection<T: ElectricCollectionModel>: Sendable {
     }
   }
 
-  private func restoredLocalSubsetResult(_ descriptor: QueryDescriptor) async throws -> ElectricSubsetResult<T> {
+  private func restoredLocalSubsetResult(_ descriptor: QueryDescriptor) async throws
+    -> ElectricSubsetResult<T>
+  {
     let localRecords = try await cacheProvider.load(T.self, request: descriptor)
     let observation = try await client.latestSubsetObservation(
       table: T.tableName,
@@ -1122,7 +1138,9 @@ public struct ElectricCollection<T: ElectricCollectionModel>: Sendable {
           logger.log(
             .warning,
             message: "Electric stream rejected invalid working-set recovery configuration",
-            metadata: ["table": T.tableName, "collection": collectionIdentifier, "error": "\(error)"]
+            metadata: [
+              "table": T.tableName, "collection": collectionIdentifier, "error": "\(error)",
+            ]
           )
           return
         }
@@ -1245,7 +1263,9 @@ public struct ElectricCollection<T: ElectricCollectionModel>: Sendable {
             attributes: batchAttributes
           ) { batchSpan in
             let batchStart = runtimeProvider.now()
-            let chunks = batch.chunked(maxMessages: electricBatchApplyChunkSize)
+            let applicationBatch = batch.wireResetProjection()
+            try applicationBatch.preflightSupportedEvents()
+            let chunks = applicationBatch.chunked(maxMessages: electricBatchApplyChunkSize)
             batchSpan.setAttribute(key: "chunk.count", value: "\(chunks.count)")
             var pendingHydrationKeys = Set<String>()
             let hasTruncateMessage = batch.messages.contains {
@@ -1495,17 +1515,18 @@ public struct ElectricCollection<T: ElectricCollectionModel>: Sendable {
           tailAdmission: ElectricReplicaDemandTailFence.Admission? = nil,
           isReplacementBootstrap: Bool = false
         ) async throws -> AppliedBatchResult {
-          try batch.preflightSupportedEvents()
+          let applicationBatch = batch.wireResetProjection()
+          try applicationBatch.preflightSupportedEvents()
           let replacesSnapshotState =
-            isReplacementBootstrap || batch.containsFullSnapshotBoundary
-          let finishesProgressiveInitialBuffering = batch.messages.contains(where: {
+            isReplacementBootstrap || applicationBatch.containsFullSnapshotBoundary
+          let finishesProgressiveInitialBuffering = applicationBatch.messages.contains(where: {
             $0.control == .upToDate || ($0.control == nil && $0.isUpToDate)
           })
           return try await replica.withStreamPublication(
             finishesProgressiveInitialBuffering: finishesProgressiveInitialBuffering
           ) {
             let filteredBatch = await replica.filterLiveBatch(
-              batch,
+              applicationBatch,
               isReplacementBootstrap: replacesSnapshotState
             )
             let result = try await applyBatchUnserialized(
@@ -1523,7 +1544,8 @@ public struct ElectricCollection<T: ElectricCollectionModel>: Sendable {
         }
 
         func hydrateMissingRows(
-          _ missingRowKeys: [String]
+          _ missingRowKeys: [String],
+          tailAdmission: ElectricReplicaDemandTailFence.Admission? = nil
         ) async throws -> Bool {
           var pendingRowKeys = Array(Set(missingRowKeys)).sorted()
           var hydrationPassCount = 0
@@ -1531,6 +1553,9 @@ public struct ElectricCollection<T: ElectricCollectionModel>: Sendable {
 
           while !pendingRowKeys.isEmpty {
             guard isSessionCurrent() else {
+              throw CancellationError()
+            }
+            if let tailAdmission, !replica.isWorkingSetTailRequestCurrent(tailAdmission) {
               throw CancellationError()
             }
 
@@ -1565,6 +1590,9 @@ public struct ElectricCollection<T: ElectricCollectionModel>: Sendable {
                 recordAsObservation: true,
                 replicaIdentity: replica.identity
               )
+              if let tailAdmission, !replica.isWorkingSetTailRequestCurrent(tailAdmission) {
+                throw CancellationError()
+              }
               guard let hydrationBatch else {
                 return AppliedBatchResult(encounteredTruncate: false, missingRowKeys: [])
               }
@@ -1572,7 +1600,8 @@ public struct ElectricCollection<T: ElectricCollectionModel>: Sendable {
                 hydrationBatch,
                 stage: "subscribe_hydration",
                 transport: transport,
-                truncateAttemptCount: truncateAttempts
+                truncateAttemptCount: truncateAttempts,
+                tailAdmission: tailAdmission
               )
               if !result.encounteredTruncate {
                 await replica.installSnapshotTracker(messages: hydrationBatch.messages)
@@ -1606,9 +1635,9 @@ public struct ElectricCollection<T: ElectricCollectionModel>: Sendable {
           }
 
           let isWorkingSetTailRunnable = await replica.isWorkingSetTailRunnable
-          if usesConfiguredWorkingSetReset && (
-            replica.isTrackerContinuityUnavailable || !isWorkingSetTailRunnable
-          ) {
+          if usesConfiguredWorkingSetReset
+            && (replica.isTrackerContinuityUnavailable || !isWorkingSetTailRunnable)
+          {
             if let recoveryToken = await replica.startWorkingSetRecoveryIfNeeded() {
               do {
                 // We already own the stream publication gate in this task;
@@ -1648,7 +1677,8 @@ public struct ElectricCollection<T: ElectricCollectionModel>: Sendable {
                 syncMode: streamSyncMode
               )
             {
-              let sseAdmission = usesConfiguredWorkingSetReset
+              let sseAdmission =
+                usesConfiguredWorkingSetReset
                 ? replica.admitWorkingSetTailRequest()
                 : nil
               if usesConfiguredWorkingSetReset, sseAdmission == nil {
@@ -1714,7 +1744,10 @@ public struct ElectricCollection<T: ElectricCollectionModel>: Sendable {
                     break
                   }
 
-                  let didHydrate = try await hydrateMissingRows(applyResult.missingRowKeys)
+                  let didHydrate = try await hydrateMissingRows(
+                    applyResult.missingRowKeys,
+                    tailAdmission: sseAdmission
+                  )
 
                   truncateAttempts = 0
                   recordSSESuccess()
@@ -1752,7 +1785,8 @@ public struct ElectricCollection<T: ElectricCollectionModel>: Sendable {
             if forceFullBootstrap {
               await armReplacementForForcedBootstrapIfNeeded()
             }
-            let pollAdmission = usesConfiguredWorkingSetReset
+            let pollAdmission =
+              usesConfiguredWorkingSetReset
               ? replica.admitWorkingSetTailRequest()
               : nil
             if usesConfiguredWorkingSetReset, pollAdmission == nil {
@@ -1862,7 +1896,10 @@ public struct ElectricCollection<T: ElectricCollectionModel>: Sendable {
                 continue
               }
 
-              _ = try await hydrateMissingRows(applyResult.missingRowKeys)
+              _ = try await hydrateMissingRows(
+                applyResult.missingRowKeys,
+                tailAdmission: pollAdmission
+              )
               truncateAttempts = 0
               // A protocol quarantine recovery remains latched across fetch
               // or apply failure. Only the terminal full snapshot that has
@@ -2034,6 +2071,7 @@ actor ElectricCollectionBackgroundCoordinator<T: ElectricCollectionModel> {
   private var acceptsCommands = true
   private var loadingContinuations: [UUID: AsyncStream<CollectionLoadingEvent>.Continuation] = [:]
   private var loadingCount: Int = 0
+  private var inflightQueryMatchTestHook: (@Sendable () -> Void)?
 
   init(
     syncMode: ElectricCollectionSyncMode,
@@ -2106,6 +2144,7 @@ actor ElectricCollectionBackgroundCoordinator<T: ElectricCollectionModel> {
       authSessionGeneration: session?.generation,
       demandSemantics: demandSemantics
     ) {
+      inflightQueryMatchTestHook?()
       return try await existing.value
     }
 
@@ -2165,8 +2204,14 @@ actor ElectricCollectionBackgroundCoordinator<T: ElectricCollectionModel> {
       let truncateAttempts = MutableValueBox(0)
       let pendingTruncateSwap = MutableValueBox(false)
       let truncateSwapPrepared = MutableValueBox(false)
-      var refetchAfterTruncate = false
+      // A wire truncate/must-refetch invalidates the server stream identity.
+      // It is categorically different from an on-demand subset restart: the
+      // next request must be an unscoped `-1` baseline with no changes-only
+      // log, after which this original descriptor is served again.
+      var mustFullBootstrapForWireReset = false
       var mustFullBootstrapForSemanticEpochTransition = false
+      var hasUsedProtocolFullBootstrapRecovery = false
+      var mustFullBootstrapForProtocolQuarantine = false
       let initiallyRequiresTrackerContinuityRecovery: Bool
       if progressiveGeneration == nil, snapshotReplica?.isTrackerContinuityUnavailable == true {
         initiallyRequiresTrackerContinuityRecovery =
@@ -2316,6 +2361,8 @@ actor ElectricCollectionBackgroundCoordinator<T: ElectricCollectionModel> {
             (mustRecoverTrackerContinuity
               && !canUseDemandedSubsetReset)
             || mustFullBootstrapForSemanticEpochTransition
+            || mustFullBootstrapForWireReset
+            || mustFullBootstrapForProtocolQuarantine
           if requiresForcedFullBootstrap {
             await armQueryReplacementIfNeeded("full_bootstrap")
           } else if requiresDemandedSubsetReset {
@@ -2380,14 +2427,14 @@ actor ElectricCollectionBackgroundCoordinator<T: ElectricCollectionModel> {
                     descriptor: descriptor,
                     syncMode: self.syncMode,
                     coverageSyncMode: demandSyncMode ?? self.syncMode,
-                    ignorePersistedSyncState: refetchAfterTruncate,
+                    ignorePersistedSyncState: false,
                     consultFetchCoverage: consultFetchCoverage,
                     recordAsObservation: recordAsObservation,
                     replicaIdentity: snapshotReplica?.identity
                   )
                 }
               if let loadedBatch {
-                try loadedBatch.preflightSupportedEvents()
+                try loadedBatch.wireResetProjection().preflightSupportedEvents()
                 for (key, value) in electricMessageAttributes(loadedBatch.messages) {
                   span.setAttribute(key: key, value: value)
                 }
@@ -2418,6 +2465,32 @@ actor ElectricCollectionBackgroundCoordinator<T: ElectricCollectionModel> {
           {
             mustFullBootstrapForSemanticEpochTransition = true
             continue
+          } catch {
+            if let quarantine = client.protocolQuarantine(for: error),
+              quarantine.compatibilityMayChangeAfterFullBootstrap,
+              !hasUsedProtocolFullBootstrapRecovery
+            {
+              // First activation has no tail owner to schedule subscribe's
+              // normal quarantine fallback. Keep its lease registered while
+              // this owner query performs the same single full-bootstrap
+              // recovery, then resume the bounded descriptor below.
+              hasUsedProtocolFullBootstrapRecovery = true
+              mustFullBootstrapForProtocolQuarantine = true
+              self.logger.log(
+                .warning,
+                message: "Electric protocol quarantine scheduled owner full-bootstrap recovery",
+                metadata: [
+                  "capability.gate": ElectricProtocolCapabilityPolicy.gateName,
+                  "detail": quarantine.detail,
+                  "reason": quarantine.reason.rawValue,
+                  "recovery.attempt": "1",
+                  "recovery.maximum_attempts": "1",
+                  "table": T.tableName,
+                ]
+              )
+              continue
+            }
+            throw error
           }
           let fetchDurationMs = max(
             0, self.runtimeProvider.now().timeIntervalSince(fetchStart) * 1000)
@@ -2453,7 +2526,8 @@ actor ElectricCollectionBackgroundCoordinator<T: ElectricCollectionModel> {
             requiresForcedFullBootstrap
             || requiresDemandedSubsetReset
             || batch.containsFullSnapshotBoundary
-          let chunks = batch.chunked(maxMessages: electricBatchApplyChunkSize)
+          let applicationBatch = batch.wireResetProjection()
+          let chunks = applicationBatch.chunked(maxMessages: electricBatchApplyChunkSize)
           let didEncounterTruncate = MutableValueBox(false)
           let applySpanAttributes = mergeTraceAttributes(
             [
@@ -2629,7 +2703,7 @@ actor ElectricCollectionBackgroundCoordinator<T: ElectricCollectionModel> {
                 // the generation-fenced recovery leader.
                 markQueryTruncateSwapPending(false)
                 if let snapshotReplica {
-                  await snapshotReplica.invalidateWorkingSetTracker()
+                  await snapshotReplica.invalidateWorkingSetTrackerUngated()
                 }
                 throw ElectricWorkingSetRecoveryRetry()
               }
@@ -2759,15 +2833,28 @@ actor ElectricCollectionBackgroundCoordinator<T: ElectricCollectionModel> {
                 "Owner snapshot reset recovery exceeded 3 retries"
               )
             }
-            refetchAfterTruncate = true
+            mustFullBootstrapForWireReset = true
             continue
+          }
+
+          if mustFullBootstrapForWireReset || mustFullBootstrapForProtocolQuarantine {
+            // The authoritative baseline is now committed. Re-run the
+            // original bounded descriptor from the terminal baseline cursor;
+            // never let a subsequent subset request reinterpret `-1` as a
+            // changes-only working-set reset.
+            let retryBoundedDemandAfterBaseline = hasDemandedSubset
+            mustFullBootstrapForWireReset = false
+            mustFullBootstrapForProtocolQuarantine = false
+            if retryBoundedDemandAfterBaseline {
+              continue
+            }
+            return appliedRecords
           }
 
           if mustRecoverTrackerContinuity || mustFullBootstrapForSemanticEpochTransition {
             mustRecoverTrackerContinuity = false
             prefersDemandedSubsetResetForTrackerContinuity = false
             mustFullBootstrapForSemanticEpochTransition = false
-            refetchAfterTruncate = false
             snapshotReplica?.markTrackerContinuityEstablished()
             if requiresDemandedSubsetReset {
               return appliedRecords
@@ -2876,6 +2963,10 @@ actor ElectricCollectionBackgroundCoordinator<T: ElectricCollectionModel> {
 
   private func removeContinuation(id: UUID) {
     loadingContinuations.removeValue(forKey: id)
+  }
+
+  func setInflightQueryMatchTestHook(_ hook: (@Sendable () -> Void)?) {
+    inflightQueryMatchTestHook = hook
   }
 
   private func matchingInflightTask(
