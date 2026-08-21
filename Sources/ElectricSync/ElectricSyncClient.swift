@@ -1603,9 +1603,17 @@ public actor ElectricSyncClientImpl {
     identity: ElectricReplicaIdentity,
     syncMode: ElectricCollectionSyncMode,
     shapeTopology: ElectricShapeTopology,
-    recoveryPolicy: ElectricTrackerContinuityRecoveryPolicy
+    recoveryPolicy: ElectricTrackerContinuityRecoveryPolicy,
+    recoveryDescriptors: [ElectricWorkingSetRecoveryDescriptor] = []
   ) throws {
-    guard recoveryPolicy == .replaceExclusiveWorkingSetFromDemandedSubsets else { return }
+    guard recoveryPolicy == .replaceExclusiveWorkingSetFromDemandedSubsets else {
+      guard recoveryDescriptors.isEmpty else {
+        throw ElectricSyncError.fetchFailed(
+          "configured working-set recovery descriptors require exclusive working-set recovery"
+        )
+      }
+      return
+    }
     let streamStateKey = persistedCursorKey(identity: identity, syncMode: syncMode)
     guard syncMode == .onDemand,
       effectiveShapeTopology(shapeTopology, streamStateKey: streamStateKey) == .dnf,
@@ -1616,6 +1624,17 @@ public actor ElectricSyncClientImpl {
     else {
       throw ElectricSyncError.fetchFailed(
         "exclusive working-set recovery configuration is unsupported"
+      )
+    }
+    if let invalidDescriptor = recoveryDescriptors.enumerated().first(where: {
+      configuredWorkingSetRecoveryDescriptorValidationReason($0.element) != nil
+    }) {
+      let reason =
+        configuredWorkingSetRecoveryDescriptorValidationReason(
+          invalidDescriptor.element
+        ) ?? "invalid descriptor"
+      throw ElectricSyncError.fetchFailed(
+        "exclusive working-set recovery descriptor \(invalidDescriptor.offset) is invalid: \(reason)"
       )
     }
   }

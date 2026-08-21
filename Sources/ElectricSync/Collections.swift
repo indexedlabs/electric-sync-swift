@@ -16,6 +16,31 @@ private final class MutableValueBox<Value>: @unchecked Sendable {
   }
 }
 
+/// Recovery queries can restart the complete configured working-set union
+/// after an authoritative baseline. Keep fallback limits with that union's
+/// epoch rather than with a single descriptor query, so a repeated wire reset
+/// or protocol quarantine cannot evade its bound by triggering typed restart.
+final class ElectricWorkingSetRecoveryFallbackBudget: @unchecked Sendable {
+  private let lock = NSLock()
+  private var wireResetAttempts = 0
+  private var usedProtocolFullBootstrapRecovery = false
+
+  func recordWireResetAttempt() -> Int {
+    lock.withLock {
+      wireResetAttempts += 1
+      return wireResetAttempts
+    }
+  }
+
+  func claimProtocolFullBootstrapRecovery() -> Bool {
+    lock.withLock {
+      guard !usedProtocolFullBootstrapRecovery else { return false }
+      usedProtocolFullBootstrapRecovery = true
+      return true
+    }
+  }
+}
+
 private struct AppliedBatchResult: Sendable {
   let encounteredTruncate: Bool
   let missingRowKeys: [String]
@@ -37,6 +62,7 @@ private struct AppliedBatchResult: Sendable {
 /// an active demand must re-contend for the actor-owned recovery epoch rather
 /// than letting this call fall through to an unscoped retry.
 struct ElectricWorkingSetRecoveryRetry: Error, Sendable {}
+struct ElectricWorkingSetRecoveryRestart: Error, Sendable {}
 
 private struct AtomicChunkApplyResult<T: ElectricCollectionModel>: Sendable {
   let index: Int
@@ -198,7 +224,7 @@ private let electricPollTransportInfoSampleEvery = 30
 private let electricExpectedTransportIssueSampleEvery = 20
 private let electricTransientHydrationMaxPasses = 5
 
-private func isBoundedWorkingSetDescriptor(_ descriptor: QueryDescriptor) -> Bool {
+func isBoundedWorkingSetDescriptor(_ descriptor: QueryDescriptor) -> Bool {
   // A reset seed is a bounded *working-set* declaration, not a convenient
   // spelling for an unscoped shape. A structured finite predicate is enough
   // (for example `to_id IN <frontier>`); a limit is optional, but when a
@@ -207,6 +233,68 @@ private func isBoundedWorkingSetDescriptor(_ descriptor: QueryDescriptor) -> Boo
   guard let predicate = descriptor.predicate?.predicate else { return false }
   if case .constant(true) = predicate.normalized() { return false }
   return true
+}
+
+func configuredWorkingSetRecoveryDescriptorValidationReason(
+  _ descriptor: ElectricWorkingSetRecoveryDescriptor
+) -> String? {
+  guard descriptor.limit.map({ $0 > 0 }) ?? true else { return "limit must be positive" }
+  guard let predicate = descriptor.predicate.predicate else {
+    return "predicate must be structured"
+  }
+  guard !matchesConstantPredicate(predicate) else {
+    return "predicate must not be constant"
+  }
+  guard descriptor.limit != nil || isFiniteWorkingSetMembershipPredicate(predicate) else {
+    return "predicate must use finite equality or membership, or provide a positive limit"
+  }
+  return nil
+}
+
+private func matchesConstantPredicate(_ predicate: SyncPredicateExpression) -> Bool {
+  if case .constant = predicate.normalized() { return true }
+  return false
+}
+
+private func isFiniteWorkingSetMembershipPredicate(_ predicate: SyncPredicateExpression) -> Bool {
+  switch predicate.normalized() {
+  case .comparison(_, .equal, _):
+    true
+  case .membership(_, let values):
+    !values.isEmpty
+  case .and(let expressions):
+    expressions.contains(where: isFiniteWorkingSetMembershipPredicate)
+  case .or(let expressions):
+    !expressions.isEmpty && expressions.allSatisfy(isFiniteWorkingSetMembershipPredicate)
+  case .constant, .comparison, .not:
+    false
+  }
+}
+
+/// A declarative bounded subset that participates in an exclusive on-demand
+/// working-set recovery.
+///
+/// Recovery descriptors are dormant configuration. They do not open a stream
+/// or retain a tail on their own; they are seeded only when an active demand
+/// must replace a lost DNF membership tracker.
+public struct ElectricWorkingSetRecoveryDescriptor: Hashable, Sendable {
+  public let predicate: SQLExpression
+  public let orderBy: [OrderBy]
+  public let limit: Int?
+
+  public init(
+    predicate: SQLExpression,
+    orderBy: [OrderBy] = [],
+    limit: Int? = nil
+  ) {
+    self.predicate = predicate
+    self.orderBy = orderBy
+    self.limit = limit
+  }
+
+  var queryDescriptor: QueryDescriptor {
+    QueryDescriptor(predicate: predicate, orderBy: orderBy, limit: limit)
+  }
 }
 
 private enum ElectricExpectedTransportIssue: String {
@@ -299,6 +387,9 @@ public struct ElectricCollectionConfiguration<T: ElectricCollectionModel>: Senda
   public let limit: Int?
   public let shapeTopology: ElectricShapeTopology
   public let trackerContinuityRecoveryPolicy: ElectricTrackerContinuityRecoveryPolicy
+  /// Dormant bounded descriptors seeded before active leases when this
+  /// collection replaces a lost exclusive DNF working set.
+  public let workingSetRecoveryDescriptors: [ElectricWorkingSetRecoveryDescriptor]
 
   public init(
     modelType: T.Type,
@@ -311,7 +402,8 @@ public struct ElectricCollectionConfiguration<T: ElectricCollectionModel>: Senda
     orderBy: [OrderBy] = [],
     limit: Int? = nil,
     shapeTopology: ElectricShapeTopology = .dnf,
-    trackerContinuityRecoveryPolicy: ElectricTrackerContinuityRecoveryPolicy = .fullBootstrap
+    trackerContinuityRecoveryPolicy: ElectricTrackerContinuityRecoveryPolicy = .fullBootstrap,
+    workingSetRecoveryDescriptors: [ElectricWorkingSetRecoveryDescriptor] = []
   ) {
     self.modelType = modelType
     self.identifier = identifier ?? modelType.collectionIdentifier
@@ -324,6 +416,7 @@ public struct ElectricCollectionConfiguration<T: ElectricCollectionModel>: Senda
     self.limit = limit
     self.shapeTopology = shapeTopology
     self.trackerContinuityRecoveryPolicy = trackerContinuityRecoveryPolicy
+    self.workingSetRecoveryDescriptors = workingSetRecoveryDescriptors
   }
 }
 
@@ -410,6 +503,29 @@ public struct ElectricCollection<T: ElectricCollectionModel>: Sendable {
     tracer
   }
 
+  private func validateWorkingSetRecoveryConfiguration(
+    syncMode: ElectricCollectionSyncMode? = nil
+  ) async throws {
+    guard
+      replica.bindWorkingSetRecoveryConfiguration(
+        policy: configuration.trackerContinuityRecoveryPolicy,
+        descriptors: configuration.workingSetRecoveryDescriptors
+      )
+    else {
+      throw ElectricSyncError.fetchFailed(
+        "working-set recovery configuration does not match the replica binding"
+      )
+    }
+    try await client.validateWorkingSetResetConfiguration(
+      T.self,
+      identity: replica.identity,
+      syncMode: syncMode ?? configuration.syncMode,
+      shapeTopology: configuration.shapeTopology,
+      recoveryPolicy: configuration.trackerContinuityRecoveryPolicy,
+      recoveryDescriptors: configuration.workingSetRecoveryDescriptors
+    )
+  }
+
   /// Internal test seam for joining a coalesced query before releasing the
   /// leader's transport. It is never installed by production callers.
   internal func setInflightQueryMatchTestHook(_ hook: (@Sendable () -> Void)?) async {
@@ -429,8 +545,7 @@ public struct ElectricCollection<T: ElectricCollectionModel>: Sendable {
     tracer: (any ElectricSyncTracer)? = nil
   ) {
     let resolvedTracer = tracer ?? NoopElectricSyncTracer()
-    self.configuration = configuration
-    self.replica = ElectricShapeReplica(
+    let replica = ElectricShapeReplica<T>(
       identity: ElectricReplicaIdentity(
         modelType: T.self,
         modelIdentifier: configuration.identifier,
@@ -446,6 +561,12 @@ public struct ElectricCollection<T: ElectricCollectionModel>: Sendable {
       logger: logger,
       tracer: resolvedTracer
     )
+    _ = replica.bindWorkingSetRecoveryConfiguration(
+      policy: configuration.trackerContinuityRecoveryPolicy,
+      descriptors: configuration.workingSetRecoveryDescriptors
+    )
+    self.configuration = configuration
+    self.replica = replica
   }
 
   public init(
@@ -454,6 +575,10 @@ public struct ElectricCollection<T: ElectricCollectionModel>: Sendable {
   ) {
     self.configuration = configuration
     self.replica = replica
+    _ = replica.bindWorkingSetRecoveryConfiguration(
+      policy: configuration.trackerContinuityRecoveryPolicy,
+      descriptors: configuration.workingSetRecoveryDescriptors
+    )
   }
 
   public func query(
@@ -535,13 +660,7 @@ public struct ElectricCollection<T: ElectricCollectionModel>: Sendable {
     guard replica.isAcceptingWork else {
       throw CancellationError()
     }
-    try await client.validateWorkingSetResetConfiguration(
-      T.self,
-      identity: replica.identity,
-      syncMode: configuration.syncMode,
-      shapeTopology: configuration.shapeTopology,
-      recoveryPolicy: configuration.trackerContinuityRecoveryPolicy
-    )
+    try await validateWorkingSetRecoveryConfiguration()
     let effectivePredicate = predicate ?? configuration.predicate
     let effectiveOrderBy = orderBy ?? configuration.orderBy
     let effectiveLimit = limit ?? configuration.limit
@@ -676,9 +795,11 @@ public struct ElectricCollection<T: ElectricCollectionModel>: Sendable {
     limit: Int? = nil,
     session: ElectricSyncSession?,
     isActiveWorkingSetRecoverySeed: Bool = false,
+    isInitialWorkingSetRecoverySeed: Bool = false,
     isActivationDemand: Bool = false,
     workingSetRecoveryEpoch: UInt64? = nil,
     workingSetRecoveryLossGeneration: UInt64? = nil,
+    workingSetRecoveryFallbackBudget: ElectricWorkingSetRecoveryFallbackBudget? = nil,
     ownerPublicationAlreadyHeld: Bool = false,
     finalizing finalize: @escaping @Sendable (ElectricSubsetResult<T>) async throws -> Void
   ) async throws -> ElectricSubsetResult<T> {
@@ -718,13 +839,7 @@ public struct ElectricCollection<T: ElectricCollectionModel>: Sendable {
       shapeTopology: configuration.shapeTopology,
       recoveryPolicy: configuration.trackerContinuityRecoveryPolicy
     )
-    try await client.validateWorkingSetResetConfiguration(
-      T.self,
-      identity: replica.identity,
-      syncMode: ownerSyncMode,
-      shapeTopology: configuration.shapeTopology,
-      recoveryPolicy: configuration.trackerContinuityRecoveryPolicy
-    )
+    try await validateWorkingSetRecoveryConfiguration()
     if usesConfiguredWorkingSetReset, replica.isTrackerContinuityUnavailable,
       !isActiveWorkingSetRecoverySeed,
       !isActivationDemand
@@ -756,8 +871,10 @@ public struct ElectricCollection<T: ElectricCollectionModel>: Sendable {
             ownerSnapshotDemand: true,
             isActivationDemand: isActivationDemand,
             isActorOwnedWorkingSetRecoverySeed: isActiveWorkingSetRecoverySeed,
+            isInitialWorkingSetRecoverySeed: isInitialWorkingSetRecoverySeed,
             workingSetRecoveryEpoch: workingSetRecoveryEpoch,
             workingSetRecoveryLossGeneration: workingSetRecoveryLossGeneration,
+            workingSetRecoveryFallbackBudget: workingSetRecoveryFallbackBudget,
             ownerPublicationAlreadyHeld: true,
             consultFetchCoverage: false,
             recordAsObservation: true,
@@ -852,13 +969,7 @@ public struct ElectricCollection<T: ElectricCollectionModel>: Sendable {
     }
     let resolvedSession = session ?? sessionProvider.captureAuthenticatedSession()
     guard let resolvedSession else { throw CancellationError() }
-    try await client.validateWorkingSetResetConfiguration(
-      T.self,
-      identity: replica.identity,
-      syncMode: configuration.syncMode,
-      shapeTopology: configuration.shapeTopology,
-      recoveryPolicy: configuration.trackerContinuityRecoveryPolicy
-    )
+    try await validateWorkingSetRecoveryConfiguration()
     try Task.checkCancellation()
     let descriptor = QueryDescriptor(predicate: predicate, orderBy: orderBy, limit: limit)
     // Registration synchronously inventories this descriptor before it becomes
@@ -954,6 +1065,7 @@ public struct ElectricCollection<T: ElectricCollectionModel>: Sendable {
     var capturedResult: ElectricSubsetResult<T>?
     var seededDescriptors = Set<QueryDescriptor>()
     var preparedTrackerForEpoch = false
+    let fallbackBudget = ElectricWorkingSetRecoveryFallbackBudget()
     while true {
       guard
         await replica.isWorkingSetRecoveryCurrent(
@@ -966,18 +1078,32 @@ public struct ElectricCollection<T: ElectricCollectionModel>: Sendable {
         // treating it as caller cancellation and releasing that lease.
         throw ElectricWorkingSetRecoveryRetry()
       }
-      let snapshot = await replica.workingSetRecoverySnapshot(prioritizing: descriptor)
+      // Configured descriptors only contribute to the recovery union. They
+      // never substitute for a committed route lease when deciding whether a
+      // snapshot transport may run.
+      guard replica.hasSynchronousActiveDemand else {
+        throw CancellationError()
+      }
+      let snapshot = await replica.workingSetRecoverySnapshot(
+        configured: configuration.workingSetRecoveryDescriptors.map(\.queryDescriptor),
+        prioritizing: descriptor
+      )
       guard !snapshot.descriptors.isEmpty else {
         throw CancellationError()
       }
+      var restartRecoveryUnion = false
       for activeDescriptor in snapshot.descriptors {
+        guard replica.hasSynchronousActiveDemand else {
+          throw CancellationError()
+        }
         guard seededDescriptors.insert(activeDescriptor).inserted else { continue }
         guard let activePredicate = activeDescriptor.predicate,
           isBoundedWorkingSetDescriptor(activeDescriptor)
         else {
           throw ElectricSyncError.fetchFailed("active working-set lease is not bounded")
         }
-        if !preparedTrackerForEpoch {
+        let isInitialSeed = !preparedTrackerForEpoch
+        if isInitialSeed {
           guard
             await replica.prepareWorkingSetRecoverySeed(
               epoch: recoveryEpoch,
@@ -988,19 +1114,31 @@ public struct ElectricCollection<T: ElectricCollectionModel>: Sendable {
           }
           preparedTrackerForEpoch = true
         }
-        let activeResult = try await ensureSubsetInternal(
-          where: activePredicate,
-          orderBy: activeDescriptor.orderBy,
-          limit: activeDescriptor.limit,
-          session: session,
-          isActiveWorkingSetRecoverySeed: true,
-          workingSetRecoveryEpoch: recoveryEpoch,
-          workingSetRecoveryLossGeneration: lossGeneration,
-          ownerPublicationAlreadyHeld: ownerPublicationAlreadyHeld,
-          finalizing: { _ in }
-        )
+        let activeResult: ElectricSubsetResult<T>
+        do {
+          activeResult = try await ensureSubsetInternal(
+            where: activePredicate,
+            orderBy: activeDescriptor.orderBy,
+            limit: activeDescriptor.limit,
+            session: session,
+            isActiveWorkingSetRecoverySeed: true,
+            isInitialWorkingSetRecoverySeed: isInitialSeed,
+            workingSetRecoveryEpoch: recoveryEpoch,
+            workingSetRecoveryLossGeneration: lossGeneration,
+            workingSetRecoveryFallbackBudget: fallbackBudget,
+            ownerPublicationAlreadyHeld: ownerPublicationAlreadyHeld,
+            finalizing: { _ in }
+          )
+        } catch is ElectricWorkingSetRecoveryRestart {
+          seededDescriptors.removeAll()
+          preparedTrackerForEpoch = false
+          capturedResult = nil
+          restartRecoveryUnion = true
+          break
+        }
         if activeDescriptor == capturedDescriptor { capturedResult = activeResult }
       }
+      if restartRecoveryUnion { continue }
       // Perform any throw-capable cache reconciliation while the epoch is
       // still parked. Once completion resumes the tail, this function must
       // not be able to invalidate an already-established generation.
@@ -1127,13 +1265,7 @@ public struct ElectricCollection<T: ElectricCollectionModel>: Sendable {
           return sessionProvider.isCurrent(session)
         }
         do {
-          try await client.validateWorkingSetResetConfiguration(
-            T.self,
-            identity: replica.identity,
-            syncMode: streamSyncMode,
-            shapeTopology: configuration.shapeTopology,
-            recoveryPolicy: configuration.trackerContinuityRecoveryPolicy
-          )
+          try await validateWorkingSetRecoveryConfiguration(syncMode: streamSyncMode)
         } catch {
           logger.log(
             .warning,
@@ -2116,8 +2248,10 @@ actor ElectricCollectionBackgroundCoordinator<T: ElectricCollectionModel> {
     ownerSnapshotDemand: Bool = false,
     isActivationDemand: Bool = false,
     isActorOwnedWorkingSetRecoverySeed: Bool = false,
+    isInitialWorkingSetRecoverySeed: Bool = false,
     workingSetRecoveryEpoch: UInt64? = nil,
     workingSetRecoveryLossGeneration: UInt64? = nil,
+    workingSetRecoveryFallbackBudget: ElectricWorkingSetRecoveryFallbackBudget? = nil,
     ownerPublicationAlreadyHeld: Bool = false,
     consultFetchCoverage: Bool = true,
     recordAsObservation: Bool = false,
@@ -2353,16 +2487,32 @@ actor ElectricCollectionBackgroundCoordinator<T: ElectricCollectionModel> {
               "exclusive working-set recovery requires a bounded structured subset"
             )
           }
+          let isWorkingSetRecoveryContinuation =
+            configuredWorkingSetReset && isActorOwnedWorkingSetRecoverySeed
+          // The first descriptor atomically establishes the replacement
+          // generation from `now`. Every later member of the same stable
+          // union resumes from that committed cursor; resetting each member
+          // from `now` would discard the preceding descriptor's continuity.
           let requiresDemandedSubsetReset =
-            mustRecoverTrackerContinuity
-            && canUseDemandedSubsetReset
-            && !mustFullBootstrapForSemanticEpochTransition
+            if isWorkingSetRecoveryContinuation {
+              isInitialWorkingSetRecoverySeed && !mustFullBootstrapForSemanticEpochTransition
+            } else {
+              mustRecoverTrackerContinuity
+                && canUseDemandedSubsetReset
+                && !mustFullBootstrapForSemanticEpochTransition
+            }
           let requiresForcedFullBootstrap =
-            (mustRecoverTrackerContinuity
-              && !canUseDemandedSubsetReset)
-            || mustFullBootstrapForSemanticEpochTransition
-            || mustFullBootstrapForWireReset
-            || mustFullBootstrapForProtocolQuarantine
+            if isWorkingSetRecoveryContinuation {
+              mustFullBootstrapForSemanticEpochTransition
+                || mustFullBootstrapForWireReset
+                || mustFullBootstrapForProtocolQuarantine
+            } else {
+              (mustRecoverTrackerContinuity
+                && !canUseDemandedSubsetReset)
+                || mustFullBootstrapForSemanticEpochTransition
+                || mustFullBootstrapForWireReset
+                || mustFullBootstrapForProtocolQuarantine
+            }
           if requiresForcedFullBootstrap {
             await armQueryReplacementIfNeeded("full_bootstrap")
           } else if requiresDemandedSubsetReset {
@@ -2467,9 +2617,12 @@ actor ElectricCollectionBackgroundCoordinator<T: ElectricCollectionModel> {
             continue
           } catch {
             if let quarantine = client.protocolQuarantine(for: error),
-              quarantine.compatibilityMayChangeAfterFullBootstrap,
-              !hasUsedProtocolFullBootstrapRecovery
+              quarantine.compatibilityMayChangeAfterFullBootstrap
             {
+              let canRecover =
+                workingSetRecoveryFallbackBudget?.claimProtocolFullBootstrapRecovery()
+                ?? !hasUsedProtocolFullBootstrapRecovery
+              guard canRecover else { throw error }
               // First activation has no tail owner to schedule subscribe's
               // normal quarantine fallback. Keep its lease registered while
               // this owner query performs the same single full-bootstrap
@@ -2827,8 +2980,11 @@ actor ElectricCollectionBackgroundCoordinator<T: ElectricCollectionModel> {
           }
 
           if didEncounterTruncate.value {
-            truncateAttempts.value += 1
-            guard truncateAttempts.value <= 3 else {
+            let wireResetAttempt =
+              workingSetRecoveryFallbackBudget?.recordWireResetAttempt()
+              ?? (truncateAttempts.value + 1)
+            truncateAttempts.value = wireResetAttempt
+            guard wireResetAttempt <= 3 else {
               throw ElectricSyncError.fetchFailed(
                 "Owner snapshot reset recovery exceeded 3 retries"
               )
@@ -2846,6 +3002,9 @@ actor ElectricCollectionBackgroundCoordinator<T: ElectricCollectionModel> {
             mustFullBootstrapForWireReset = false
             mustFullBootstrapForProtocolQuarantine = false
             if retryBoundedDemandAfterBaseline {
+              if isWorkingSetRecoveryContinuation {
+                throw ElectricWorkingSetRecoveryRestart()
+              }
               continue
             }
             return appliedRecords
@@ -2855,7 +3014,12 @@ actor ElectricCollectionBackgroundCoordinator<T: ElectricCollectionModel> {
             mustRecoverTrackerContinuity = false
             prefersDemandedSubsetResetForTrackerContinuity = false
             mustFullBootstrapForSemanticEpochTransition = false
-            snapshotReplica?.markTrackerContinuityEstablished()
+            // An actor-owned exclusive working-set recovery has more stable
+            // union members to seed. Only its coordinator may establish
+            // continuity, after the final seed and inventory-revision check.
+            if !isActorOwnedWorkingSetRecoverySeed {
+              snapshotReplica?.markTrackerContinuityEstablished()
+            }
             if requiresDemandedSubsetReset {
               return appliedRecords
             }
