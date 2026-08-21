@@ -1481,6 +1481,7 @@ public actor ElectricSyncClientImpl {
       && T.electricLocalTableOwnership == .exclusive
       && T.moveOutTombstoneTimeToLive == nil
       && metadataProvider.supportsDurableRowOwnership
+      && metadataProvider.supportsExclusiveWorkingSetReset
   }
 
   func usesConfiguredOnDemandWorkingSetReset<T: ElectricCollectionModel>(
@@ -1494,10 +1495,33 @@ public actor ElectricSyncClientImpl {
       syncMode == .onDemand,
       T.electricLocalTableOwnership == .exclusive,
       T.moveOutTombstoneTimeToLive == nil,
-      metadataProvider.supportsDurableRowOwnership
+      metadataProvider.supportsDurableRowOwnership,
+      metadataProvider.supportsExclusiveWorkingSetReset
     else { return false }
     let streamStateKey = persistedCursorKey(identity: identity, syncMode: syncMode)
     return effectiveShapeTopology(shapeTopology, streamStateKey: streamStateKey) == .dnf
+  }
+
+  func validateWorkingSetResetConfiguration<T: ElectricCollectionModel>(
+    _: T.Type,
+    identity: ElectricReplicaIdentity,
+    syncMode: ElectricCollectionSyncMode,
+    shapeTopology: ElectricShapeTopology,
+    recoveryPolicy: ElectricTrackerContinuityRecoveryPolicy
+  ) throws {
+    guard recoveryPolicy == .replaceExclusiveWorkingSetFromDemandedSubsets else { return }
+    let streamStateKey = persistedCursorKey(identity: identity, syncMode: syncMode)
+    guard syncMode == .onDemand,
+      effectiveShapeTopology(shapeTopology, streamStateKey: streamStateKey) == .dnf,
+      T.electricLocalTableOwnership == .exclusive,
+      T.moveOutTombstoneTimeToLive == nil,
+      metadataProvider.supportsDurableRowOwnership,
+      metadataProvider.supportsExclusiveWorkingSetReset
+    else {
+      throw ElectricSyncError.fetchFailed(
+        "exclusive working-set recovery configuration is unsupported"
+      )
+    }
   }
 
   @discardableResult
