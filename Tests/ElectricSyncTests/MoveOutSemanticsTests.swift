@@ -830,7 +830,7 @@ private struct VersionedMoveOutModel: ElectricCollectionModel, Equatable {
   }
 
   @Test
-  func moveInRejectsTruncatePreparationBeforeOwnershipRelease() async throws {
+  func wireResetProjectionDiscardsMoveInBeforeTruncatePreparation() async throws {
     let store = VersionedMoveOutStore()
     store.upsert(VersionedMoveOutRow(id: "row-1", version: 1))
     let metadata = InMemoryMetadataProvider()
@@ -870,19 +870,17 @@ private struct VersionedMoveOutModel: ElectricCollectionModel, Equatable {
         fetchTracker: ElectricFetchTracker(metadataProvider: metadata)
       )
     )
-    do {
-      _ = try await client.pollStream(
+    let batch = try #require(
+      try await client.pollStream(
         VersionedMoveOutModel.self,
         basePredicate: nil,
         syncMode: .onDemand,
         live: false
       )
-      Issue.record("Expected move-in protocol input to be quarantined during intake")
-    } catch ElectricSyncError.protocolQuarantined(let quarantine) {
-      #expect(quarantine.reason == .moveIn)
-    } catch {
-      Issue.record("Expected a typed move-in quarantine, got \(error)")
-    }
+    )
+    #expect(batch.messages.count == 1)
+    #expect(batch.messages.first?.kind == .truncate)
+    #expect(try batch.apply(in: store).encounteredTruncate)
     #expect(store.row(id: "row-1") == VersionedMoveOutRow(id: "row-1", version: 1))
     #expect(metadata.ownerCount(table: VersionedMoveOutModel.tableName, rowKey: "row-1") == 1)
   }
@@ -2455,7 +2453,7 @@ private struct VersionedMoveOutModel: ElectricCollectionModel, Equatable {
   }
 
   @Test
-  func truncatePersistsEarlierMaterializationForReplacementCleanup() async throws {
+  func truncateDropsEarlierMaterializationBeforeReplacementCleanup() async throws {
     let store = VersionedMoveOutStore()
     let metadata = InMemoryMetadataProvider()
     let insert = try #require(
@@ -2500,8 +2498,8 @@ private struct VersionedMoveOutModel: ElectricCollectionModel, Equatable {
       )
     )
     #expect(try truncateBatch.apply(in: store).encounteredTruncate)
-    #expect(store.row(id: "row-1")?.version == 1)
-    #expect(metadata.ownerCount(table: VersionedMoveOutModel.tableName, rowKey: "row-1") == 1)
+    #expect(store.row(id: "row-1") == nil)
+    #expect(metadata.ownerCount(table: VersionedMoveOutModel.tableName, rowKey: "row-1") == 0)
 
     let replacementBatch = try #require(
       try await client.pollStream(

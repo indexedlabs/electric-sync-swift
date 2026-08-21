@@ -19,6 +19,15 @@ private struct SubsetObservationEvidence: Sendable {
   }
 }
 
+/// A wire reset invalidates every preceding mutation and protocol payload in
+/// its logical batch. The controls themselves remain protocol-validated.
+private func wireResetControls(in messages: [ElectricMessage]) -> [ElectricMessage]? {
+  let controls = messages.filter {
+    $0.kind == .truncate || $0.control == .mustRefetch
+  }
+  return controls.isEmpty ? nil : controls
+}
+
 /// Process-local fallback for a shape that was incorrectly declared simple.
 ///
 /// Electric 1.7.7 sends tagged DNF protocol fields for any server WHERE clause
@@ -75,6 +84,7 @@ public struct SyncBatch<T: ElectricCollectionModel>: Sendable {
   private let shapeTopology: ElectricShapeTopology
   private let shapeTopologyLatch: ElectricShapeTopologyLatch?
   private let protocolInputMessages: [ElectricMessage]
+  private let isWireResetProjection: Bool
   private let replacesExclusiveWorkingSet: Bool
   private let isExternallyForcedFullBootstrap: Bool
 
@@ -109,6 +119,7 @@ public struct SyncBatch<T: ElectricCollectionModel>: Sendable {
     shapeTopology: ElectricShapeTopology = .dnf,
     shapeTopologyLatch: ElectricShapeTopologyLatch? = nil,
     protocolInputMessages: [ElectricMessage]? = nil,
+    isWireResetProjection: Bool = false,
     replacesExclusiveWorkingSet: Bool = false,
     isExternallyForcedFullBootstrap: Bool = false
   ) {
@@ -147,6 +158,7 @@ public struct SyncBatch<T: ElectricCollectionModel>: Sendable {
     self.shapeTopology = shapeTopology
     self.shapeTopologyLatch = shapeTopologyLatch
     self.protocolInputMessages = protocolInputMessages ?? messages
+    self.isWireResetProjection = isWireResetProjection
     self.replacesExclusiveWorkingSet = replacesExclusiveWorkingSet
     self.isExternallyForcedFullBootstrap = isExternallyForcedFullBootstrap
   }
@@ -203,7 +215,10 @@ public struct SyncBatch<T: ElectricCollectionModel>: Sendable {
   private func replacing(
     messages: [ElectricMessage],
     shouldRecordEvidence: Bool,
-    shouldRemoveExpiredMoveOutTombstones: Bool
+    shouldRemoveExpiredMoveOutTombstones: Bool,
+    protocolInputMessages: [ElectricMessage]? = nil,
+    isWireResetProjection: Bool? = nil,
+    suppressFetchAndObservationEvidence: Bool = false
   ) -> SyncBatch<T> {
     SyncBatch(
       collectionIdentifier: collectionIdentifier,
@@ -213,8 +228,10 @@ public struct SyncBatch<T: ElectricCollectionModel>: Sendable {
       basePredicateHash: basePredicateHash,
       fetchPredicate: fetchPredicate,
       fetchDescriptor: fetchDescriptor,
-      shouldRecordFetch: shouldRecordFetch && shouldRecordEvidence,
-      shouldRecordObservation: shouldRecordObservation && shouldRecordEvidence,
+      shouldRecordFetch: !suppressFetchAndObservationEvidence && shouldRecordFetch
+        && shouldRecordEvidence,
+      shouldRecordObservation: !suppressFetchAndObservationEvidence && shouldRecordObservation
+        && shouldRecordEvidence,
       shouldPersistSyncState: shouldPersistSyncState
         && (!persistSyncStateOnlyAtTerminalBoundary || shouldRecordEvidence
           || messages.contains { $0.control == .mustRefetch || $0.kind == .truncate }),
@@ -230,14 +247,17 @@ public struct SyncBatch<T: ElectricCollectionModel>: Sendable {
       cursorOwnershipDiagnostics: cursorOwnershipDiagnostics,
       cursorWriterClientId: cursorWriterClientId,
       isRollbackDualWriteEnabled: isRollbackDualWriteEnabled,
-      observationEvidence: observationEvidence,
+      observationEvidence: suppressFetchAndObservationEvidence
+        ? SubsetObservationEvidence(messages: [])
+        : observationEvidence,
       protocolCapabilityPolicy: protocolCapabilityPolicy,
       protocolSemanticEpoch: protocolSemanticEpoch,
       runtimeProvider: runtimeProvider,
       requiresSemanticEpochReset: requiresSemanticEpochReset,
       shapeTopology: shapeTopology,
       shapeTopologyLatch: shapeTopologyLatch,
-      protocolInputMessages: protocolInputMessages,
+      protocolInputMessages: protocolInputMessages ?? self.protocolInputMessages,
+      isWireResetProjection: isWireResetProjection ?? self.isWireResetProjection,
       replacesExclusiveWorkingSet: replacesExclusiveWorkingSet,
       isExternallyForcedFullBootstrap: isExternallyForcedFullBootstrap
     )
@@ -248,6 +268,22 @@ public struct SyncBatch<T: ElectricCollectionModel>: Sendable {
       messages: messages,
       shouldRecordEvidence: true,
       shouldRemoveExpiredMoveOutTombstones: shouldRemoveExpiredMoveOutTombstones
+    )
+  }
+
+  /// Produces the sole logical reset payload for a batch. Both writer input
+  /// and capability validation intentionally omit discarded predecessors.
+  func wireResetProjection() -> SyncBatch<T> {
+    guard !isWireResetProjection, let controls = wireResetControls(in: messages) else {
+      return self
+    }
+    return replacing(
+      messages: controls,
+      shouldRecordEvidence: false,
+      shouldRemoveExpiredMoveOutTombstones: shouldRemoveExpiredMoveOutTombstones,
+      protocolInputMessages: controls,
+      isWireResetProjection: true,
+      suppressFetchAndObservationEvidence: true
     )
   }
 
@@ -338,6 +374,13 @@ public struct SyncBatch<T: ElectricCollectionModel>: Sendable {
   /// Applies the sync batch to the local database.
   /// MUST be called within a transaction.
   public func apply(in transactionContext: Any?) throws -> Output {
+    let applicationBatch = wireResetProjection()
+    if applicationBatch.isWireResetProjection, !isWireResetProjection {
+      // Direct users of SyncBatch must observe the same reset fence as the
+      // coordinator paths: a late control invalidates all earlier mutations.
+      return try applicationBatch.apply(in: transactionContext)
+    }
+
     let processAttributes = mergeTraceAttributes(
       [
         "stage": "batch_process",
@@ -974,7 +1017,8 @@ public struct SyncBatch<T: ElectricCollectionModel>: Sendable {
     }
     if replacesExclusiveWorkingSet {
       guard metadataProvider.supportsDurableRowOwnership else {
-        throw ElectricSyncError.fetchFailed("exclusive working-set reset requires durable ownership")
+        throw ElectricSyncError.fetchFailed(
+          "exclusive working-set reset requires durable ownership")
       }
       try metadataProvider.clearExclusiveWorkingSetOwnership(
         table: T.tableName,
@@ -1285,7 +1329,9 @@ public actor ElectricSyncClientImpl {
     case refused(reason: String)
   }
 
-  private static let bridgeCompatibleModes: Set<ElectricCollectionSyncMode> = [.eager, .progressive]
+  private static let bridgeCompatibleModes: Set<ElectricCollectionSyncMode> = [
+    .eager, .progressive,
+  ]
 
   private func rebuildSimpleTrackerIfAdmissible<T: ElectricCollectionModel>(
     _: T.Type,
@@ -2371,11 +2417,13 @@ public actor ElectricSyncClientImpl {
           semanticEpoch: protocolSemanticEpoch
         )
       }
-      if requiresSemanticEpochReset(
-        syncState: resumedSyncState.persistedState,
-        tracker: tracker,
-        semanticEpoch: protocolSemanticEpoch
-      ) {
+      if !forceFullBootstrap,
+        requiresSemanticEpochReset(
+          syncState: resumedSyncState.persistedState,
+          tracker: tracker,
+          semanticEpoch: protocolSemanticEpoch
+        )
+      {
         span.setAttribute(key: "result", value: "semantic_epoch_reset")
         return SyncBatch(
           collectionIdentifier: replicaIdentity.modelIdentifier,
@@ -2648,7 +2696,6 @@ public actor ElectricSyncClientImpl {
               name: "electric.live_stream.batch",
               attributes: attributes
             )
-            await self.recordMessages(messages)
             let batch = SyncBatch<T>(
               collectionIdentifier: replicaIdentity.modelIdentifier,
               streamStateKey: streamStateKey,
@@ -2675,8 +2722,10 @@ public actor ElectricSyncClientImpl {
               shapeTopology: shapeTopology,
               shapeTopologyLatch: shapeTopologyLatch
             )
-            try batch.preflightSupportedEvents()
-            continuation.yield(batch)
+            let applicationBatch = batch.wireResetProjection()
+            try applicationBatch.preflightSupportedEvents()
+            await self.recordMessages(applicationBatch.messages)
+            continuation.yield(applicationBatch)
             batchSpan.end(status: .success)
           }
 
@@ -2840,7 +2889,6 @@ public actor ElectricSyncClientImpl {
           } catch {
             throw quarantiningProtocolError(error)
           }
-          try preflightProtocolMessages(page, semanticEpoch: protocolSemanticEpoch)
           for (key, value) in electricMessageAttributes(page) {
             attemptSpan.setAttribute(key: key, value: value)
           }
@@ -2861,21 +2909,22 @@ public actor ElectricSyncClientImpl {
 
         buffered.append(contentsOf: page)
 
-        let hasTruncate = page.contains(where: Self.isStreamReset)
-        if hasTruncate {
+        if let resetControls = wireResetControls(in: buffered) {
+          try preflightProtocolMessages(resetControls, semanticEpoch: protocolSemanticEpoch)
           span.setAttribute(key: "attempt.count", value: "\(attemptsUsed)")
           span.setAttribute(key: "message.fetched.count", value: "\(fetchedMessageCount)")
           span.setAttribute(key: "boundary.kind", value: "truncate")
           for (key, value) in electricMessageAttributes(buffered) {
             span.setAttribute(key: key, value: value)
           }
-          return buffered
+          return resetControls
         }
 
         let boundaryInPage = completionBoundary.isPresent(in: page)
 
         if boundaryInPage {
           hasReachedBoundary = true
+          try preflightProtocolMessages(buffered, semanticEpoch: protocolSemanticEpoch)
           span.setAttribute(
             key: "boundary.kind",
             value: completionBoundary.rawValue
@@ -3161,7 +3210,8 @@ public actor ElectricSyncClientImpl {
       // mode's key was atomically migrated from another compatible mode by the
       // application, so the simple tracker rebuild may treat it like exact
       // continuity for statically simple shapes.
-      let source: ResumeSource = state?.bridgedFromSyncMode != nil ? .legacyBridged : .legacyPreCutover
+      let source: ResumeSource =
+        state?.bridgedFromSyncMode != nil ? .legacyBridged : .legacyPreCutover
       return ResumedSyncState(
         state: state,
         source: source,

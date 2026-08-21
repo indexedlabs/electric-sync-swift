@@ -1550,7 +1550,13 @@ struct ElectricSyncClientTests {
       responses: [
         [.truncate(handle: "next-handle")],
         [
-          ElectricMessage.make(record: TestRecord(id: "1", name: "Alpha"), offset: "offset-1"),
+          ElectricMessage.make(
+            record: TestRecord(id: "1", name: "Baseline"), offset: "offset-bootstrap"),
+          ElectricMessage.upToDate(offset: "offset-bootstrap"),
+        ],
+        [
+          ElectricMessage.make(
+            record: TestRecord(id: "1", name: "Alpha"), offset: "offset-1", isSubsetSnapshot: true),
           ElectricMessage.subsetEnd(offset: "offset-1"),
         ],
       ]
@@ -1575,19 +1581,10 @@ struct ElectricSyncClientTests {
       predicate: .comparison(field: "id", op: .equal, value: .string("1"))
     )
 
-    let results: [TestRecord]
-    do {
-      results = try await collection.query(where: predicate, orderBy: [], limit: 1)
-    } catch {
-      let trace = await http.capturedRequests().map {
-        "offset=\($0.offset ?? "nil") handle=\($0.handle ?? "nil") live=\($0.live) subset=\($0.subset != nil)"
-      }
-      Issue.record("query threw \(error); requests: \(trace)")
-      throw error
-    }
+    let results = try await collection.query(where: predicate, orderBy: [], limit: 1)
 
     #expect(results.count == 1)
-    #expect(await http.requestCount() == 2)
+    #expect(await http.requestCount() == 3)
     #expect(store.clearCallCount() == 1)
     #expect(await eventHandler.willTruncateCount() == 1)
     #expect(await eventHandler.didTruncateCount() == 1)
@@ -1600,10 +1597,14 @@ struct ElectricSyncClientTests {
       ])
 
     let requests = await http.capturedRequests()
-    let retryRequest = try #require(requests.last)
+    let retryRequest = requests[1]
     #expect(retryRequest.offset == "-1")
     #expect(retryRequest.handle?.hasPrefix("cachebust-") == true)
     #expect(retryRequest.cursor == nil)
+    #expect(retryRequest.subset == nil)
+    #expect(retryRequest.log == nil)
+    #expect(requests[2].offset == "offset-bootstrap")
+    #expect(requests[2].subset != nil)
     let streamStateKey = legacyStreamStateKey(
       for: TestRecord.self,
       basePredicate: nil,
@@ -1626,7 +1627,13 @@ struct ElectricSyncClientTests {
       responses: [
         [.truncate(handle: "next-handle")],
         [
-          ElectricMessage.make(record: TestRecord(id: "1", name: "Alpha"), offset: "offset-1"),
+          ElectricMessage.make(
+            record: TestRecord(id: "1", name: "Baseline"), offset: "offset-bootstrap"),
+          ElectricMessage.upToDate(offset: "offset-bootstrap"),
+        ],
+        [
+          ElectricMessage.make(
+            record: TestRecord(id: "1", name: "Alpha"), offset: "offset-1", isSubsetSnapshot: true),
           ElectricMessage.subsetEnd(offset: "offset-1"),
         ],
       ]
@@ -1672,16 +1679,22 @@ struct ElectricSyncClientTests {
     let results = try await collection.query(where: predicate, orderBy: [], limit: 1)
 
     #expect(results.count == 1)
-    #expect(await http.requestCount() == 2)
+    #expect(await http.requestCount() == 3)
 
     let requests = await http.capturedRequests()
     let firstRequest = try #require(requests.first)
     #expect(firstRequest.offset == "offset-live")
-    let retryRequest = try #require(requests.last)
+    let retryRequest = requests[1]
     // The retry must not resume from the invalidated persisted identity.
     #expect(retryRequest.offset == "-1")
     #expect(retryRequest.handle?.hasPrefix("cachebust-") == true)
     #expect(retryRequest.cursor == nil)
+
+    #expect(requests.count == 3)
+    #expect(requests[1].subset == nil)
+    #expect(requests[1].log == nil)
+    #expect(requests[2].offset == "offset-bootstrap")
+    #expect(requests[2].subset != nil)
 
     // The reset and terminal subset retry commit through the same owner writer.
     let persisted = try #require(
@@ -2651,7 +2664,7 @@ struct ElectricSyncClientTests {
     store.upsert(TestRecord(id: "existing", name: "Existing generation"))
 
     let decodeChunkSize = 200
-    let interruptedReplacement =
+    let interruptedInitial =
       (0..<decodeChunkSize).map { index in
         ElectricMessage.make(
           record: TestRecord(id: "interrupted-\(index)", name: "Interrupted \(index)"),
@@ -2664,11 +2677,10 @@ struct ElectricSyncClientTests {
     let finalRecord = TestRecord(id: "replacement", name: "Replacement generation")
     let http = InMemoryHTTPClientProvider(
       responses: [
-        [.truncate(handle: "replacement")],
-        interruptedReplacement,
+        interruptedInitial,
         [
           .make(record: finalRecord, offset: "replacement-final"),
-          .subsetEnd(offset: "replacement-final"),
+          .upToDate(offset: "replacement-final"),
         ],
       ]
     )
@@ -2687,9 +2699,151 @@ struct ElectricSyncClientTests {
     #expect(store.allRecords() == [finalRecord])
     #expect(store.clearCallCount() == 1)
     let requests = await http.capturedRequests()
-    #expect(requests.count == 3)
+    #expect(requests.count == 2)
     #expect(requests[1].offset == "-1")
+  }
+
+  @Test
+  func lateWireTruncateDoesNotCommitPrecedingRecordsWhenBootstrapFails() async throws {
+    let metadata = InMemoryMetadataProvider(supportsDurableRowOwnership: false)
+    let store = TestRecordStore()
+    let existing = TestRecord(id: "existing", name: "Existing generation")
+    store.upsert(existing)
+
+    let messages =
+      (0..<200).map { index in
+        ElectricMessage.make(
+          record: TestRecord(id: "interrupted-\(index)", name: "Interrupted \(index)"),
+          offset: "interrupted-\(index)"
+        )
+      } + [.truncate(handle: "replacement")]
+    let http = InMemoryHTTPClientProvider(responses: [messages])
+    let client = ElectricSyncClientImpl(
+      configuration: .init(
+        metadataProvider: metadata,
+        httpClient: http,
+        fetchTracker: ElectricFetchTracker(metadataProvider: metadata)
+      )
+    )
+    let collection = makeTestCollection(client: client, store: store)
+
+    await #expect(throws: ElectricSyncError.self) {
+      let _: [TestRecord] = try await collection.query(where: nil, orderBy: [], limit: nil)
+    }
+
+    #expect(store.allRecords() == [existing])
+    #expect(await http.requestCount() == 2)
+  }
+
+  @Test
+  func directBatchResetProjectionDropsMalformedPredecessorBeforeApply() async throws {
+    let metadata = InMemoryMetadataProvider()
+    let store = TestRecordStore()
+    let http = InMemoryHTTPClientProvider(
+      responses: [[.upToDate(offset: "ordinary-offset")]]
+    )
+    let client = ElectricSyncClientImpl(
+      configuration: .init(
+        metadataProvider: metadata,
+        httpClient: http,
+        protocolCapabilityPolicy: .enabled
+      )
+    )
+    let ordinaryBatch = try #require(
+      try await client.pollStream(
+        TestRecord.self,
+        basePredicate: nil,
+        syncMode: .onDemand,
+        live: false
+      )
+    )
+    let malformedPredecessor = ElectricMessage(
+      payload: Data(),
+      offset: "poison-offset",
+      kind: .mutation,
+      event: .moveIn(patterns: [MovePattern(pos: 0, value: "poison")])
+    )
+    let resetBatch = ordinaryBatch.filteringMessages([
+      malformedPredecessor,
+      .truncate(handle: "replacement"),
+    ])
+
+    let output = try resetBatch.apply(in: store)
+
+    #expect(output.encounteredTruncate)
+    #expect(store.allRecords().isEmpty)
+    let state = try #require(
+      try metadata.getSyncState(
+        collectionId: legacyStreamStateKey(
+          for: TestRecord.self,
+          basePredicate: nil,
+          syncMode: .onDemand
+        ),
+        transaction: nil
+      )
+    )
+    #expect(state.offset == "-1")
+    #expect(state.handle == nil)
+    #expect(state.cursor == nil)
+  }
+
+  @Test
+  func multipageMalformedPredecessorIsDiscardedByWireResetBeforeStrictBootstrap() async throws {
+    let metadata = InMemoryMetadataProvider(supportsDurableRowOwnership: false)
+    let store = TestRecordStore()
+    let baseline = TestRecord(id: "baseline", name: "Baseline")
+    let subset = TestRecord(id: "subset", name: "Subset")
+    let malformedPredecessor = ElectricMessage(
+      payload: Data(),
+      offset: "poison-offset",
+      kind: .mutation,
+      event: .moveIn(patterns: [MovePattern(pos: 0, value: "poison")])
+    )
+    let http = InMemoryHTTPClientProvider(
+      responses: [
+        [malformedPredecessor],
+        [.truncate(handle: "replacement")],
+        [
+          .make(record: baseline, offset: "bootstrap-offset", key: baseline.id),
+          .upToDate(offset: "bootstrap-offset"),
+        ],
+        [
+          .make(
+            record: subset,
+            offset: "subset-offset",
+            key: subset.id,
+            isSubsetSnapshot: true
+          ),
+          .subsetEnd(offset: "subset-offset"),
+        ],
+      ]
+    )
+    let client = ElectricSyncClientImpl(
+      configuration: .init(
+        metadataProvider: metadata,
+        httpClient: http,
+        fetchTracker: ElectricFetchTracker(metadataProvider: metadata),
+        protocolCapabilityPolicy: .enabled
+      )
+    )
+    let collection = makeTestCollection(client: client, store: store)
+
+    let records: [TestRecord] = try await collection.query(
+      where: SQLExpression("id = 'subset'"),
+      orderBy: [],
+      limit: nil
+    )
+
+    #expect(records == [subset])
+    #expect(store.allRecords() == [subset])
+    let requests = await http.capturedRequests()
+    #expect(requests.count == 4)
+    #expect(requests[1].offset == "poison-offset")
     #expect(requests[2].offset == "-1")
+    #expect(requests[2].subset == nil)
+    #expect(requests[2].log == nil)
+    #expect(requests[3].offset == "now")
+    #expect(requests[3].subset != nil)
   }
 
   @Test
@@ -2734,7 +2888,7 @@ struct ElectricSyncClientTests {
           GRDBAtomicTestRecord(id: "replacement-\(index)", name: "Replacement \(index)"),
           offset: "replacement-\(index)"
         )
-      } + [.subsetEnd(offset: "replacement-201")]
+      } + [.upToDate(offset: "replacement-201")]
     let http = InMemoryHTTPClientProvider(
       responses: [
         [.truncate(handle: nil)],
@@ -2976,11 +3130,9 @@ struct ElectricSyncClientTests {
           ElectricMessage.make(
             record: fresh,
             offset: "offset-fresh",
-            cursor: "cursor-fresh",
-            isSubsetSnapshot: true
+            cursor: "cursor-fresh"
           ),
-          ElectricMessage.snapshotEnd(offset: "offset-fresh"),
-          ElectricMessage.subsetEnd(offset: "offset-fresh"),
+          ElectricMessage.upToDate(offset: "offset-fresh"),
         ],
       ]
     )
@@ -4683,6 +4835,110 @@ struct ElectricSyncClientTests {
     #expect(
       try metadata.getSyncState(collectionId: identity.persistedCursorKey, transaction: nil)?.offset
         == "-1")
+  }
+
+  @Test
+  func sseWireResetProjectsMalformedPredecessorBeforeYieldingControl() async throws {
+    let metadata = InMemoryMetadataProvider()
+    let store = TestRecordStore()
+    let identity = ElectricReplicaIdentity(
+      modelType: TestRecord.self,
+      modelIdentifier: TestRecord.collectionIdentifier,
+      basePredicate: nil
+    )
+    try metadata.updateSyncState(
+      collectionId: identity.persistedCursorKey,
+      state: SyncState(
+        offset: "live-offset",
+        handle: "live-handle",
+        cursor: nil,
+        isUpToDate: true,
+        lastSyncedAt: nil,
+        protocolSemanticEpoch: .taggedShape1_7_7
+      ),
+      transaction: nil
+    )
+    let malformedPredecessor = ElectricMessage(
+      payload: Data(),
+      offset: "poison-offset",
+      kind: .mutation,
+      event: .moveIn(patterns: [MovePattern(pos: 0, value: "poison")])
+    )
+    let client = ElectricSyncClientImpl(
+      configuration: .init(
+        metadataProvider: metadata,
+        httpClient: InMemoryHTTPClientProvider(responses: []),
+        httpStreamClient: ScriptedHTTPStreamClientProvider(streams: [
+          [
+            malformedPredecessor,
+            .truncate(handle: "replacement"),
+          ]
+        ]),
+        isExactCursorCutoverEnabled: true,
+        protocolCapabilityPolicy: .enabled
+      )
+    )
+    let stream = try #require(
+      try await client.liveBatchStream(
+        TestRecord.self,
+        basePredicate: nil,
+        syncMode: .onDemand,
+        replicaIdentity: identity
+      )
+    )
+    var iterator = stream.makeAsyncIterator()
+    let batch = try #require(try await iterator.next())
+
+    #expect(batch.messages.count == 1)
+    #expect(batch.messages.first?.kind == .truncate)
+    #expect(try batch.apply(in: store).encounteredTruncate)
+    #expect(store.allRecords().isEmpty)
+    #expect(
+      try metadata.getSyncState(collectionId: identity.persistedCursorKey, transaction: nil)?.offset
+        == "-1"
+    )
+  }
+
+  @Test
+  func malformedWireResetControlFailsClosedDuringBufferedHTTPPreflight() async throws {
+    let malformedReset = ElectricMessage(
+      payload: Data(),
+      offset: "bad-reset-offset",
+      kind: .truncate,
+      control: .upToDate
+    )
+    let metadata = InMemoryMetadataProvider()
+    let client = ElectricSyncClientImpl(
+      configuration: .init(
+        metadataProvider: metadata,
+        httpClient: InMemoryHTTPClientProvider(responses: [[malformedReset]]),
+        protocolCapabilityPolicy: .enabled
+      )
+    )
+
+    do {
+      _ = try await client.pollStream(
+        TestRecord.self,
+        basePredicate: nil,
+        syncMode: .onDemand,
+        live: false
+      )
+      Issue.record("Expected malformed reset control to be quarantined")
+    } catch ElectricSyncError.protocolQuarantined(let quarantine) {
+      #expect(quarantine.reason == .control)
+    } catch {
+      Issue.record("Expected control quarantine, received \(error)")
+    }
+    #expect(
+      try metadata.getSyncState(
+        collectionId: legacyStreamStateKey(
+          for: TestRecord.self,
+          basePredicate: nil,
+          syncMode: .onDemand
+        ),
+        transaction: nil
+      ) == nil
+    )
   }
 
   @Test(.timeLimit(.minutes(1)))
