@@ -19,7 +19,24 @@ private final class MutableValueBox<Value>: @unchecked Sendable {
 private struct AppliedBatchResult: Sendable {
   let encounteredTruncate: Bool
   let missingRowKeys: [String]
+  let recoveryCause: ElectricSyncRecoveryCause?
+
+  init(
+    encounteredTruncate: Bool,
+    missingRowKeys: [String],
+    recoveryCause: ElectricSyncRecoveryCause? = nil
+  ) {
+    self.encounteredTruncate = encounteredTruncate
+    self.missingRowKeys = missingRowKeys
+    self.recoveryCause = recoveryCause
+  }
 }
+
+/// Internal control flow: a process-local DNF tracker was discovered lost
+/// while applying a request. The request has already fenced its stale cursor;
+/// an active demand must re-contend for the actor-owned recovery epoch rather
+/// than letting this call fall through to an unscoped retry.
+struct ElectricWorkingSetRecoveryRetry: Error, Sendable {}
 
 private struct AtomicChunkApplyResult<T: ElectricCollectionModel>: Sendable {
   let index: Int
@@ -818,69 +835,72 @@ public struct ElectricCollection<T: ElectricCollectionModel>: Sendable {
     // therefore sees this route in its replay inventory rather than treating
     // it as an after-the-fact one-shot query.
     let leaseID = await replica.registerActiveDemand(descriptor)
-    let result: ElectricSubsetResult<T>
+    var resolvedResult: ElectricSubsetResult<T>?
     var recoveryEpoch: UInt64?
     do {
-      let usesWorkingSetReset = await client.usesConfiguredOnDemandWorkingSetReset(
-        T.self,
-        identity: replica.identity,
-        syncMode: configuration.syncMode,
-        shapeTopology: configuration.shapeTopology,
-        recoveryPolicy: configuration.trackerContinuityRecoveryPolicy
-      )
-      let recoveryNeedsSeed = await replica.workingSetRecoveryNeedsSeed()
-      let mustRecover = usesWorkingSetReset && (
-        replica.isTrackerContinuityUnavailable || recoveryNeedsSeed
-      )
-      if mustRecover {
-        if !replica.isTrackerContinuityUnavailable {
-          // The last lease had parked an otherwise-continuous tail. A new
-          // lease needs only its ordinary subset, not a generation reset.
-          await replica.resumeWorkingSetTailForActiveLease()
-          result = try await ensureSubset(
-            where: predicate, orderBy: orderBy, limit: limit, session: resolvedSession
+      while resolvedResult == nil {
+        do {
+          let usesWorkingSetReset = await client.usesConfiguredOnDemandWorkingSetReset(
+            T.self,
+            identity: replica.identity,
+            syncMode: configuration.syncMode,
+            shapeTopology: configuration.shapeTopology,
+            recoveryPolicy: configuration.trackerContinuityRecoveryPolicy
           )
-        } else if let recoveryToken = await replica.startWorkingSetRecoveryIfNeeded() {
-          recoveryEpoch = recoveryToken.epoch
-          // This is the only external recovery leader. Hold the snapshot gate
-          // across every revision pass so the canonical tail is parked once,
-          // not once per descriptor.
-          result = try await replica.ensureSubset {
-            try await recoverActiveWorkingSet(
-              session: resolvedSession,
-              prioritizing: descriptor,
-              captureResultFor: descriptor,
-              ownerPublicationAlreadyHeld: true,
-              recoveryEpoch: recoveryToken.epoch,
-              lossGeneration: recoveryToken.lossGeneration
+          let recoveryNeedsSeed = await replica.workingSetRecoveryNeedsSeed()
+          let mustRecover = usesWorkingSetReset && (
+            replica.isTrackerContinuityUnavailable || recoveryNeedsSeed
+          )
+          if mustRecover {
+            if let recoveryToken = await replica.startWorkingSetRecoveryIfNeeded() {
+              recoveryEpoch = recoveryToken.epoch
+              // This is the only external recovery leader. Hold the snapshot gate
+              // across every revision pass so the canonical tail is parked once,
+              // not once per descriptor.
+              resolvedResult = try await replica.ensureSubset {
+                try await recoverActiveWorkingSet(
+                  session: resolvedSession,
+                  prioritizing: descriptor,
+                  captureResultFor: descriptor,
+                  ownerPublicationAlreadyHeld: true,
+                  recoveryEpoch: recoveryToken.epoch,
+                  lossGeneration: recoveryToken.lossGeneration
+                )
+              }
+            } else {
+              try await replica.waitForWorkingSetTailRunnable()
+              // Another activation performed the network seed. `localRecords` is
+              // authoritative after its transaction; `appliedRecords` remains
+              // empty because this caller did not issue that response.
+              resolvedResult = try await restoredLocalSubsetResult(descriptor)
+            }
+          } else {
+            resolvedResult = try await ensureSubset(
+              where: predicate,
+              orderBy: orderBy,
+              limit: limit,
+              session: resolvedSession
             )
           }
-        } else {
-          try await replica.waitForWorkingSetTailReadiness()
-          // Another activation performed the network seed. `localRecords` is
-          // authoritative after its transaction; `appliedRecords` remains
-          // empty because this caller did not issue that response.
-          result = try await restoredLocalSubsetResult(descriptor)
+        } catch is ElectricWorkingSetRecoveryRetry {
+          recoveryEpoch = nil
+          continue
         }
-      } else {
-        result = try await ensureSubset(
-          where: predicate,
-          orderBy: orderBy,
-          limit: limit,
-          session: resolvedSession
-        )
       }
+      guard let result = resolvedResult else {
+        throw CancellationError()
+      }
+      let streamToken = keepSynced(session: resolvedSession)
+      let lease = ElectricSubsetDemandLease(onCancel: {
+        replica.releaseActiveDemand(leaseID)
+        streamToken.cancel()
+      })
+      return ElectricSubsetDemandActivation(lease: lease, result: result)
     } catch {
       if let recoveryEpoch { replica.failWorkingSetRecovery(epoch: recoveryEpoch) }
       replica.releaseActiveDemand(leaseID)
       throw error
     }
-    let streamToken = keepSynced(session: resolvedSession)
-    let lease = ElectricSubsetDemandLease(onCancel: {
-      replica.releaseActiveDemand(leaseID)
-      streamToken.cancel()
-    })
-    return ElectricSubsetDemandActivation(lease: lease, result: result)
   }
 
   /// Seeds stable snapshots of the actor-owned lease inventory. The caller
@@ -1305,10 +1325,22 @@ public struct ElectricCollection<T: ElectricCollectionModel>: Sendable {
             }) {
               let chunk = chunks[truncateResult.index]
               let output = truncateResult.output
+              let isWorkingSetLocalTrackerLoss =
+                usesConfiguredWorkingSetReset
+                && output.recoveryCause == .localTrackerContinuity
+              if isWorkingSetLocalTrackerLoss {
+                // The bounded recovery seed performs its own exclusive atomic
+                // replacement. Do not leave a generic truncate swap armed to
+                // erase that fresh working set on the next tail delta.
+                markTruncateSwapPending(false)
+              }
               // A synthetic reset (tracker-loss full bootstrap) carries no
               // truncate message, so arm the replacement swap from the apply
               // output. The replacement snapshot itself publishes atomically.
-              if output.requiresReplacementSwap, pendingTruncateSwap.value != true {
+              if output.requiresReplacementSwap,
+                !isWorkingSetLocalTrackerLoss,
+                pendingTruncateSwap.value != true
+              {
                 logger.log(
                   .warning,
                   message: "Electric replacement reset armed from apply result (subscribe)",
@@ -1328,7 +1360,8 @@ public struct ElectricCollection<T: ElectricCollectionModel>: Sendable {
               await Task.yield()
               return AppliedBatchResult(
                 encounteredTruncate: true,
-                missingRowKeys: []
+                missingRowKeys: [],
+                recoveryCause: output.recoveryCause
               )
             }
 
@@ -1510,8 +1543,10 @@ public struct ElectricCollection<T: ElectricCollectionModel>: Sendable {
             break
           }
 
-          let isWorkingSetTailReady = await replica.isWorkingSetTailReady
-          if usesConfiguredWorkingSetReset && (replica.isTrackerContinuityUnavailable || !isWorkingSetTailReady) {
+          let isWorkingSetTailRunnable = await replica.isWorkingSetTailRunnable
+          if usesConfiguredWorkingSetReset && (
+            replica.isTrackerContinuityUnavailable || !isWorkingSetTailRunnable
+          ) {
             if let recoveryToken = await replica.startWorkingSetRecoveryIfNeeded() {
               do {
                 // We already own the stream publication gate in this task;
@@ -1533,7 +1568,7 @@ public struct ElectricCollection<T: ElectricCollectionModel>: Sendable {
             // With no leases the actor refuses leadership. A cancellation of
             // this parked tail is observable, so activation can cancel/reseed
             // it without the historic readiness deadlock.
-            try await replica.waitForWorkingSetTailReadiness()
+            try await replica.waitForWorkingSetTailRunnable()
             continue
           }
 
@@ -1576,6 +1611,13 @@ public struct ElectricCollection<T: ElectricCollectionModel>: Sendable {
                     truncateAttemptCount: truncateAttempts
                   )
                   if applyResult.encounteredTruncate {
+                    if usesConfiguredWorkingSetReset,
+                      applyResult.recoveryCause == .localTrackerContinuity
+                    {
+                      await replica.invalidateWorkingSetTracker()
+                      reconnectAfterHydration = true
+                      break
+                    }
                     truncateAttempts += 1
                     if truncateAttempts <= 3 {
                       try? await runtimeProvider.sleep(for: .milliseconds(100))
@@ -1701,6 +1743,12 @@ public struct ElectricCollection<T: ElectricCollectionModel>: Sendable {
                 )
               }
               if applyResult.encounteredTruncate {
+                if usesConfiguredWorkingSetReset,
+                  applyResult.recoveryCause == .localTrackerContinuity
+                {
+                  await replica.invalidateWorkingSetTracker()
+                  continue
+                }
                 truncateAttempts += 1
                 if truncateAttempts <= 3 {
                   try? await runtimeProvider.sleep(for: .milliseconds(100))
@@ -1732,6 +1780,11 @@ public struct ElectricCollection<T: ElectricCollectionModel>: Sendable {
             // Always loop; Electric live poll should keep returning up_to_date
             // headers every interval. Avoid hot loop via a tiny yield.
             await Task.yield()
+          } catch is ElectricWorkingSetRecoveryRetry {
+            // A concurrent generation loss invalidated the waiter this raw
+            // tail was parked on. Re-enter admission; an active lease will
+            // elect the next reset leader before any tail request is issued.
+            continue
           } catch is CancellationError {
             // Expected when SwiftUI cancels the request (e.g., navigating away)
             break
@@ -2401,6 +2454,20 @@ actor ElectricCollectionBackgroundCoordinator<T: ElectricCollectionModel> {
             }) {
               let chunk = chunks[truncateResult.index]
               let output = truncateResult.output
+              let isWorkingSetLocalTrackerLoss =
+                configuredWorkingSetReset
+                && output.recoveryCause == .localTrackerContinuity
+              if isWorkingSetLocalTrackerLoss {
+                // The active-demand coordinator owns the only replacement
+                // transaction. Do not leave this route's generic swap armed,
+                // then hand control back to activateDemand to elect/rejoin
+                // the generation-fenced recovery leader.
+                markQueryTruncateSwapPending(false)
+                if let snapshotReplica {
+                  await snapshotReplica.invalidateWorkingSetTracker()
+                }
+                throw ElectricWorkingSetRecoveryRetry()
+              }
               if output.requiresReplacementSwap, !pendingTruncateSwap.value {
                 self.logger.log(
                   .warning,

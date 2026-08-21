@@ -1,5 +1,9 @@
 import Foundation
 
+enum ElectricSyncRecoveryCause: Sendable, Equatable {
+  case localTrackerContinuity
+}
+
 let electricMoveOutTombstoneCleanupBatchSize = 200
 
 private struct SubsetObservationEvidence: Sendable {
@@ -148,6 +152,7 @@ public struct SyncBatch<T: ElectricCollectionModel>: Sendable {
     public let records: [T]
     public let subsetSnapshotRecords: [T]
     public let encounteredTruncate: Bool
+    var recoveryCause: ElectricSyncRecoveryCause? = nil
     public let missingRowKeys: [String]
     fileprivate let cursorOwnershipCollisionReports: [ElectricCursorOwnershipCollisionReport]
     /// True when this apply invalidated the replica's resume state and a
@@ -371,7 +376,10 @@ public struct SyncBatch<T: ElectricCollectionModel>: Sendable {
       let taggedShapeCapabilityEnabled =
         protocolSemanticEpoch.isTaggedShapeCapabilityEnabled
 
-      func forceTrackerLossFullBootstrap(reasonAttribute: String) throws -> Output {
+      func forceTrackerLossFullBootstrap(
+        reasonAttribute: String,
+        recoveryCause: ElectricSyncRecoveryCause? = nil
+      ) throws -> Output {
         guard shouldPersistSyncState || persistSyncStateOnlyAtTerminalBoundary else {
           throw ElectricSyncError.trackerContinuityBootstrapRequired
         }
@@ -406,6 +414,7 @@ public struct SyncBatch<T: ElectricCollectionModel>: Sendable {
           missingRowKeys: [],
           cursorOwnershipCollisionReports: cursorOwnershipCollisionReports
         )
+        output.recoveryCause = recoveryCause
         output.requiresReplacementSwap = true
         output.onTransactionCommitted = { moveOutTracker.reset() }
         return output
@@ -420,7 +429,8 @@ public struct SyncBatch<T: ElectricCollectionModel>: Sendable {
         try preflightSupportedEvents(transactionContext: transactionContext)
       } catch ElectricSyncError.trackerContinuityBootstrapRequired {
         return try forceTrackerLossFullBootstrap(
-          reasonAttribute: "tracker_preflight_full_bootstrap"
+          reasonAttribute: "tracker_preflight_full_bootstrap",
+          recoveryCause: .localTrackerContinuity
         )
       }
 
@@ -452,7 +462,8 @@ public struct SyncBatch<T: ElectricCollectionModel>: Sendable {
         processSpan.setAttribute(
           key: "tracker_rebuild.active_conditions_latched_dnf", value: "true")
         return try forceTrackerLossFullBootstrap(
-          reasonAttribute: "tracker_rebuild_active_conditions_full_bootstrap"
+          reasonAttribute: "tracker_rebuild_active_conditions_full_bootstrap",
+          recoveryCause: .localTrackerContinuity
         )
       }
 
@@ -539,7 +550,8 @@ public struct SyncBatch<T: ElectricCollectionModel>: Sendable {
         } else if messages.contains(where: Self.isTaggedProtocolInput) {
           batchMoveOutTracker.reset()
           return try forceTrackerLossFullBootstrap(
-            reasonAttribute: "tracker_loss_full_bootstrap"
+            reasonAttribute: "tracker_loss_full_bootstrap",
+            recoveryCause: .localTrackerContinuity
           )
         }
       }
@@ -1204,6 +1216,19 @@ public actor ElectricSyncClientImpl {
     return tracker
   }
 
+  /// Discards the process-local DNF membership state for a runtime owner that
+  /// was evicted. Durable row ownership remains intact, but it cannot prove
+  /// the per-disjunct condition tracker needed to resume a tagged tail.
+  func invalidateProcessLocalTracker(
+    identity: ElectricReplicaIdentity,
+    syncMode: ElectricCollectionSyncMode
+  ) {
+    let streamStateKey = persistedCursorKey(identity: identity, syncMode: syncMode)
+    // Reset in place so an already-fetched batch cannot retain a stale
+    // tracker reference across a concurrent runtime-loss notification.
+    moveOutTracker(streamStateKey: streamStateKey).reset()
+  }
+
   private func makeMoveOutTracker() -> MoveOutTagTracker {
     let capabilityPolicy = protocolCapabilityPolicy
     return MoveOutTagTracker(
@@ -1458,6 +1483,16 @@ public actor ElectricSyncClientImpl {
     }
 
     guard !tracker.isContinuityEstablished else { return false }
+    // The explicit exclusive DNF policy is itself an admission contract: a
+    // lost tracker must route through an active bounded demand so it can
+    // replace the working set. It is neither the legacy statically-simple
+    // rebuild nor permission to fall through to an unscoped full bootstrap.
+    if recoveryPolicy == .replaceExclusiveWorkingSetFromDemandedSubsets,
+      syncMode == .onDemand,
+      effectiveShapeTopology == .dnf
+    {
+      return true
+    }
     if requiresProcessTrackerContinuity(T.self, shapeTopology: effectiveShapeTopology) {
       return true
     }
@@ -1923,7 +1958,13 @@ public actor ElectricSyncClientImpl {
           tracker: tracker,
           semanticEpoch: protocolSemanticEpoch
         ),
-        !resumedSyncState.hasPersistedFullBootstrap || ignorePersistedSyncState
+        // An exclusive working-set seed deliberately follows a locally
+        // persisted full-bootstrap fence. It owns the atomic replacement and
+        // must start from `now`, not turn that fence into a second `-1`
+        // replay. Other callers remain fail-closed.
+        !resumedSyncState.hasPersistedFullBootstrap
+          || ignorePersistedSyncState
+          || restartOnDemandFromNow
       else {
         throw ElectricSyncError.capabilitySemanticEpochTransitionDeferred
       }

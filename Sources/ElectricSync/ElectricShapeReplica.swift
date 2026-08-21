@@ -252,12 +252,16 @@ public final class ElectricShapeReplica<Model: ElectricCollectionModel>: @unchec
       runtimeProvider: client.runtimeProvider,
       diagnostics: client.cursorOwnershipDiagnostics
     )
+    let identity = self.identity
     let trackerContinuity = self.trackerContinuity
     let workingSetRecovery = self.workingSetRecovery
     let progressiveInitialBuffer = self.progressiveInitialBuffer
     self.streamController.onRuntimeOwnerEviction = {
       let generation = trackerContinuity.markLost()
-      Task { await workingSetRecovery.markLost(generation: generation) }
+      Task {
+        await client.invalidateProcessLocalTracker(identity: identity, syncMode: syncMode)
+        await workingSetRecovery.markLost(generation: generation)
+      }
       progressiveInitialBuffer.restart()
     }
   }
@@ -288,18 +292,28 @@ public final class ElectricShapeReplica<Model: ElectricCollectionModel>: @unchec
   }
 
   func failWorkingSetRecovery(epoch: UInt64? = nil) {
-    _ = trackerContinuity.markLost()
-    Task { await workingSetRecovery.fail(epoch: epoch) }
+    let trackerContinuity = trackerContinuity
+    Task {
+      await workingSetRecovery.failIfCurrent(epoch: epoch) {
+        trackerContinuity.markLost()
+      }
+    }
   }
 
-  var isWorkingSetTailReady: Bool {
-    get async { await workingSetRecovery.isReady }
+  func invalidateWorkingSetTracker() async {
+    let generation = trackerContinuity.markLost()
+    await client.invalidateProcessLocalTracker(identity: identity, syncMode: .onDemand)
+    await workingSetRecovery.markLost(generation: generation)
   }
 
-  func waitForWorkingSetTailReadiness() async throws {
+  var isWorkingSetTailRunnable: Bool {
+    get async { await workingSetRecovery.isTailRunnable }
+  }
+
+  func waitForWorkingSetTailRunnable() async throws {
     try workGate.checkAcceptingWork()
     try Task.checkCancellation()
-    try await workingSetRecovery.waitUntilReady()
+    try await workingSetRecovery.waitUntilTailRunnable()
     try workGate.checkAcceptingWork()
     try Task.checkCancellation()
   }
@@ -340,10 +354,6 @@ public final class ElectricShapeReplica<Model: ElectricCollectionModel>: @unchec
   }
 
   func workingSetRecoveryNeedsSeed() async -> Bool { await workingSetRecovery.needsSeed }
-
-  func resumeWorkingSetTailForActiveLease() async {
-    await workingSetRecovery.resumeForActiveLease()
-  }
 
   func isWorkingSetRecoveryCurrent(epoch: UInt64, lossGeneration: UInt64) async -> Bool {
     await workingSetRecovery.isCurrent(epoch: epoch, lossGeneration: lossGeneration)
@@ -549,7 +559,7 @@ private actor ElectricReplicaWorkingSetRecoveryCoordinator {
   private var recoveryLossGeneration: UInt64 = 0
   private var waiters: [UUID: CheckedContinuation<Void, Error>] = [:]
 
-  var isReady: Bool { ready }
+  var isTailRunnable: Bool { ready && !values.isEmpty }
   var needsSeed: Bool { recovering || !ready }
 
   func isCurrent(epoch: UInt64, lossGeneration: UInt64) -> Bool {
@@ -560,21 +570,13 @@ private actor ElectricReplicaWorkingSetRecoveryCoordinator {
     let id = UUID()
     values[id] = descriptor
     revision &+= 1
+    resumeTailWaitersIfRunnable()
     return id
   }
 
   func release(_ id: UUID) {
     guard values.removeValue(forKey: id) != nil else { return }
     revision &+= 1
-    if values.isEmpty, !recovering { ready = false }
-  }
-
-  func resumeForActiveLease() {
-    guard !values.isEmpty, !recovering, !ready else { return }
-    ready = true
-    let continuations = waiters.values
-    waiters.removeAll()
-    for continuation in continuations { continuation.resume() }
   }
 
   /// Returns true for exactly one recovery leader. It deliberately leaves
@@ -616,7 +618,7 @@ private actor ElectricReplicaWorkingSetRecoveryCoordinator {
     revision expectedRevision: UInt64,
     epoch expectedEpoch: UInt64,
     lossGeneration expectedLossGeneration: UInt64,
-    establishTracker: @Sendable () -> Void
+    establishTracker: @Sendable () -> Bool
   ) -> Bool {
     guard recovering,
       recoveryEpoch == expectedEpoch,
@@ -624,29 +626,35 @@ private actor ElectricReplicaWorkingSetRecoveryCoordinator {
       knownLossGeneration == expectedLossGeneration,
       revision == expectedRevision
     else { return false }
-    guard !values.isEmpty else {
+    guard establishTracker() else {
+      // A synchronous eviction can advance the tracker generation just before
+      // its actor hop arrives. Never advertise this stale seed as runnable.
+      recoveryEpoch &+= 1
       recovering = false
       ready = false
+      retryWaiters()
       return false
     }
     recovering = false
-    establishTracker()
+    // Continuity is independent of demand liveness. A lease can disappear
+    // after its serial seed commits; keep this generation established so a
+    // later lease performs its ordinary subset, while the tail remains parked
+    // because `isTailRunnable` also requires a non-empty inventory.
     ready = true
-    let continuations = waiters.values
-    waiters.removeAll()
-    for continuation in continuations { continuation.resume() }
+    resumeTailWaitersIfRunnable()
     return true
   }
 
-  func fail(epoch expectedEpoch: UInt64?) {
+  func failIfCurrent(
+    epoch expectedEpoch: UInt64?,
+    markTrackerLost: @Sendable () -> UInt64
+  ) {
     if let expectedEpoch, expectedEpoch != recoveryEpoch { return }
+    let lossGeneration = markTrackerLost()
+    knownLossGeneration = max(knownLossGeneration, lossGeneration)
     recovering = false
     ready = false
-    let continuations = waiters.values
-    waiters.removeAll()
-    for continuation in continuations {
-      continuation.resume(throwing: CancellationError())
-    }
+    failWaiters()
   }
 
   func markLost(generation: UInt64) {
@@ -655,14 +663,15 @@ private actor ElectricReplicaWorkingSetRecoveryCoordinator {
     recoveryEpoch &+= 1
     ready = false
     recovering = false
+    retryWaiters()
   }
 
-  func waitUntilReady() async throws {
-    guard !ready else { return }
+  func waitUntilTailRunnable() async throws {
+    guard !isTailRunnable else { return }
     let id = UUID()
     try await withTaskCancellationHandler {
       try await withCheckedThrowingContinuation { continuation in
-        if ready {
+        if isTailRunnable {
           continuation.resume()
         } else {
           waiters[id] = continuation
@@ -676,6 +685,29 @@ private actor ElectricReplicaWorkingSetRecoveryCoordinator {
   private func cancelWaiter(_ id: UUID) {
     guard let continuation = waiters.removeValue(forKey: id) else { return }
     continuation.resume(throwing: CancellationError())
+  }
+
+  private func resumeTailWaitersIfRunnable() {
+    guard isTailRunnable else { return }
+    let continuations = waiters.values
+    waiters.removeAll()
+    for continuation in continuations { continuation.resume() }
+  }
+
+  private func failWaiters() {
+    let continuations = waiters.values
+    waiters.removeAll()
+    for continuation in continuations {
+      continuation.resume(throwing: CancellationError())
+    }
+  }
+
+  private func retryWaiters() {
+    let continuations = waiters.values
+    waiters.removeAll()
+    for continuation in continuations {
+      continuation.resume(throwing: ElectricWorkingSetRecoveryRetry())
+    }
   }
 }
 
@@ -755,10 +787,12 @@ private final class ElectricReplicaTrackerContinuity: @unchecked Sendable {
 
   var currentGeneration: UInt64 { lock.withLock { generation } }
 
-  func markEstablished(ifCurrent expectedGeneration: UInt64) {
+  @discardableResult
+  func markEstablished(ifCurrent expectedGeneration: UInt64) -> Bool {
     lock.withLock {
-      guard generation == expectedGeneration else { return }
+      guard generation == expectedGeneration else { return false }
       established = true
+      return true
     }
   }
 
