@@ -616,6 +616,7 @@ public struct ElectricCollection<T: ElectricCollectionModel>: Sendable {
     orderBy: [OrderBy] = [],
     limit: Int? = nil,
     session: ElectricSyncSession?,
+    deferWorkingSetTailReadiness: Bool = false,
     finalizing finalize: @escaping @Sendable (ElectricSubsetResult<T>) async throws -> Void
   ) async throws -> ElectricSubsetResult<T> {
     guard replica.isAcceptingWork else {
@@ -726,12 +727,12 @@ public struct ElectricCollection<T: ElectricCollectionModel>: Sendable {
           "hasObservation": "\(result.observation != nil)",
         ]) { _, new in new }
       )
-      if beginsWorkingSetRecovery {
+      if beginsWorkingSetRecovery && !deferWorkingSetTailReadiness {
         replica.completeWorkingSetRecovery()
       }
       return result
     } catch {
-      if beginsWorkingSetRecovery {
+      if beginsWorkingSetRecovery && !deferWorkingSetTailReadiness {
         replica.failWorkingSetRecovery()
       }
       let durationMs = max(0, runtimeProvider.now().timeIntervalSince(subsetStart) * 1000)
@@ -773,13 +774,48 @@ public struct ElectricCollection<T: ElectricCollectionModel>: Sendable {
     let leaseID = replica.registerActiveDemand(descriptor)
     let result: ElectricSubsetResult<T>
     do {
-      result = try await ensureSubset(
-        where: predicate,
-        orderBy: orderBy,
-        limit: limit,
-        session: resolvedSession
+      let usesWorkingSetReset = await client.usesConfiguredOnDemandWorkingSetReset(
+        T.self,
+        identity: replica.identity,
+        syncMode: configuration.syncMode,
+        shapeTopology: configuration.shapeTopology,
+        recoveryPolicy: configuration.trackerContinuityRecoveryPolicy
       )
+      let mustRecover = usesWorkingSetReset && replica.isTrackerContinuityUnavailable
+      if mustRecover {
+        replica.beginWorkingSetRecovery()
+        var triggeringResult: ElectricSubsetResult<T>?
+        for activeDescriptor in replica.activeDemandDescriptors(prioritizing: descriptor) {
+          guard let activePredicate = activeDescriptor.predicate,
+            isBoundedWorkingSetDescriptor(activeDescriptor)
+          else {
+            throw ElectricSyncError.fetchFailed("active working-set lease is not bounded")
+          }
+          let activeResult = try await ensureSubset(
+            where: activePredicate,
+            orderBy: activeDescriptor.orderBy,
+            limit: activeDescriptor.limit,
+            session: resolvedSession,
+            deferWorkingSetTailReadiness: true,
+            finalizing: { _ in }
+          )
+          if activeDescriptor == descriptor { triggeringResult = activeResult }
+        }
+        replica.completeWorkingSetRecovery()
+        guard let triggeringResult else {
+          throw ElectricSyncError.fetchFailed("triggering working-set demand was not replayed")
+        }
+        result = triggeringResult
+      } else {
+        result = try await ensureSubset(
+          where: predicate,
+          orderBy: orderBy,
+          limit: limit,
+          session: resolvedSession
+        )
+      }
     } catch {
+      replica.failWorkingSetRecovery()
       replica.releaseActiveDemand(leaseID)
       throw error
     }
@@ -1337,7 +1373,9 @@ public struct ElectricCollection<T: ElectricCollectionModel>: Sendable {
                   where: predicate,
                   orderBy: descriptor.orderBy,
                   limit: descriptor.limit,
-                  session: session
+                  session: session,
+                  deferWorkingSetTailReadiness: true,
+                  finalizing: { _ in }
                 )
               }
               replica.completeWorkingSetRecovery()
@@ -1882,6 +1920,14 @@ actor ElectricCollectionBackgroundCoordinator<T: ElectricCollectionModel> {
             shapeTopology: shapeTopology,
             recoveryPolicy: trackerContinuityRecoveryPolicy
           )
+          if mustRecoverTrackerContinuity,
+            configuredWorkingSetReset,
+            !ownerSnapshotDemand
+          {
+            throw ElectricSyncError.fetchFailed(
+              "exclusive working-set recovery requires an active demand lease"
+            )
+          }
           let canUseDemandedSubsetReset =
             prefersDemandedSubsetResetForTrackerContinuity && hasDemandedSubset
             && (!configuredWorkingSetReset || ownerSnapshotDemand)
