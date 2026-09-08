@@ -472,6 +472,22 @@ public struct ElectricShapeRequest: Sendable {
   public let log: ElectricLogMode?
   public let replica: ElectricReplicaMode
   public let subset: ElectricSubsetRequest?
+  /// Extra shape query parameters for this request, keyed by parameter name.
+  ///
+  /// A shape endpoint may accept parameters that are not expressible as a row
+  /// predicate — a directive about which rows the *shape* should serve rather
+  /// than a filter over rows it already serves. Those cannot travel in the
+  /// predicate: a demand predicate is sent as `subset__where` and never reaches
+  /// the code that forms shape parameters, and the only slot that does reach it
+  /// is the base predicate, which defines the replica identity.
+  ///
+  /// Carried here so a caller can send one without altering the base predicate.
+  /// The value is opaque to this package: it is handed to the model's
+  /// `HTTPClientProvider`, which already knows how to serialise its own
+  /// endpoint's parameters. Deliberately not part of `ElectricReplicaIdentity`,
+  /// so a request carrying parameters addresses the same replica and the same
+  /// cursor as one without them.
+  public let requestParameters: [String: [String]]
 
   public init(
     wireIdentity: ElectricShapeWireIdentity? = nil,
@@ -485,7 +501,8 @@ public struct ElectricShapeRequest: Sendable {
     live: Bool = false,
     log: ElectricLogMode? = nil,
     replica: ElectricReplicaMode = .default,
-    subset: ElectricSubsetRequest? = nil
+    subset: ElectricSubsetRequest? = nil,
+    requestParameters: [String: [String]] = [:]
   ) {
     self.wireIdentity = wireIdentity ?? .unspecified(table: table)
     self.table = table
@@ -499,6 +516,7 @@ public struct ElectricShapeRequest: Sendable {
     self.log = log
     self.replica = replica
     self.subset = subset
+    self.requestParameters = requestParameters
   }
 
   public func updating(
@@ -519,7 +537,8 @@ public struct ElectricShapeRequest: Sendable {
       live: live ?? self.live,
       log: log,
       replica: replica,
-      subset: subset
+      subset: subset,
+      requestParameters: requestParameters
     )
   }
 
@@ -536,7 +555,8 @@ public struct ElectricShapeRequest: Sendable {
       live: live,
       log: log,
       replica: replica,
-      subset: subset
+      subset: subset,
+      requestParameters: requestParameters
     )
   }
 
@@ -553,7 +573,26 @@ public struct ElectricShapeRequest: Sendable {
       live: live,
       log: log,
       replica: replica,
-      subset: subset
+      subset: subset,
+      requestParameters: requestParameters
+    )
+  }
+
+  public func with(requestParameters: [String: [String]]) -> ElectricShapeRequest {
+    ElectricShapeRequest(
+      wireIdentity: wireIdentity,
+      table: table,
+      predicate: predicate,
+      orderBy: orderBy,
+      limit: limit,
+      offset: offset,
+      handle: handle,
+      cursor: cursor,
+      live: live,
+      log: log,
+      replica: replica,
+      subset: subset,
+      requestParameters: requestParameters
     )
   }
 
@@ -570,7 +609,8 @@ public struct ElectricShapeRequest: Sendable {
       live: live,
       log: log,
       replica: replica,
-      subset: subset
+      subset: subset,
+      requestParameters: requestParameters
     )
   }
 
@@ -587,7 +627,8 @@ public struct ElectricShapeRequest: Sendable {
       live: live,
       log: log,
       replica: replica,
-      subset: subset
+      subset: subset,
+      requestParameters: requestParameters
     )
   }
 }
@@ -704,17 +745,25 @@ public struct QueryDescriptor: Hashable, Sendable {
   public let orderBy: [OrderBy]
   public let limit: Int?
   public let cursor: ElectricCursorExpressions?
+  /// Extra shape query parameters to send with this query's subset request.
+  ///
+  /// Part of the descriptor's identity on purpose: two queries that differ only
+  /// in their parameters are different requests and must not deduplicate onto
+  /// one another.
+  public let requestParameters: [String: [String]]
 
   public init(
     predicate: SQLExpression?,
     orderBy: [OrderBy] = [],
     limit: Int? = nil,
-    cursor: ElectricCursorExpressions? = nil
+    cursor: ElectricCursorExpressions? = nil,
+    requestParameters: [String: [String]] = [:]
   ) {
     self.predicate = predicate
     self.orderBy = orderBy
     self.limit = limit
     self.cursor = cursor
+    self.requestParameters = requestParameters
   }
 }
 

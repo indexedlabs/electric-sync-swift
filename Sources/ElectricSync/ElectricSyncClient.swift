@@ -2076,6 +2076,10 @@ public actor ElectricSyncClientImpl {
       ).with(wireIdentity: replicaIdentity.wireIdentity)
 
       request = request.with(log: logModeFor(syncMode: syncMode))
+      // Applied on the snapshot paths only. `pollStream` and `liveBatchStream`
+      // take no descriptor and must not carry them: these are parameters for a
+      // one-shot subset read, not for the continuous tail.
+      request = request.with(requestParameters: descriptor.requestParameters)
 
       let messages: [ElectricMessage]
       let fetchCallCount: Int
@@ -2262,6 +2266,10 @@ public actor ElectricSyncClientImpl {
       ).with(wireIdentity: replicaIdentity.wireIdentity)
 
       request = request.with(log: logModeFor(syncMode: syncMode))
+      // Applied on the snapshot paths only. `pollStream` and `liveBatchStream`
+      // take no descriptor and must not carry them: these are parameters for a
+      // one-shot subset read, not for the continuous tail.
+      request = request.with(requestParameters: descriptor.requestParameters)
 
       let messages: [ElectricMessage]
       let fetchCallCount: Int

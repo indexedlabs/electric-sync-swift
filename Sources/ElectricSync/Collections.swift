@@ -581,11 +581,17 @@ public struct ElectricCollection<T: ElectricCollectionModel>: Sendable {
     )
   }
 
+  /// - Parameter requestParameters: extra shape query parameters to send with
+  ///   this query's subset request, keyed by parameter name. Use for a
+  ///   directive the shape endpoint accepts that is not expressible as a row
+  ///   predicate. They do not affect the base predicate, so the replica
+  ///   identity and its cursor are unchanged.
   public func query(
     where predicate: SQLExpression? = nil,
     orderBy: [OrderBy]? = nil,
     limit: Int? = nil,
-    cursor: ElectricCursorExpressions? = nil
+    cursor: ElectricCursorExpressions? = nil,
+    requestParameters: [String: [String]] = [:]
   ) async throws -> [T] {
     guard let session = sessionProvider.captureAuthenticatedSession() else {
       throw CancellationError()
@@ -595,6 +601,7 @@ public struct ElectricCollection<T: ElectricCollectionModel>: Sendable {
       orderBy: orderBy,
       limit: limit,
       cursor: cursor,
+      requestParameters: requestParameters,
       session: session
     )
   }
@@ -604,6 +611,7 @@ public struct ElectricCollection<T: ElectricCollectionModel>: Sendable {
     orderBy: [OrderBy]? = nil,
     limit: Int? = nil,
     cursor: ElectricCursorExpressions? = nil,
+    requestParameters: [String: [String]] = [:],
     session: ElectricSyncSession?
   ) async throws -> [T] {
     let queryStart = runtimeProvider.now()
@@ -640,6 +648,7 @@ public struct ElectricCollection<T: ElectricCollectionModel>: Sendable {
         orderBy: orderBy,
         limit: limit,
         cursor: cursor,
+        requestParameters: requestParameters,
         session: session
       )
       logOutcome("applied", rows: rows.count)
@@ -655,6 +664,7 @@ public struct ElectricCollection<T: ElectricCollectionModel>: Sendable {
     orderBy: [OrderBy]? = nil,
     limit: Int? = nil,
     cursor: ElectricCursorExpressions? = nil,
+    requestParameters: [String: [String]] = [:],
     session: ElectricSyncSession?
   ) async throws -> [T] {
     guard replica.isAcceptingWork else {
@@ -669,7 +679,8 @@ public struct ElectricCollection<T: ElectricCollectionModel>: Sendable {
       predicate: effectivePredicate,
       orderBy: effectiveOrderBy,
       limit: effectiveLimit,
-      cursor: cursor
+      cursor: cursor,
+      requestParameters: requestParameters
     )
 
     return try await coordinator.performCommand {
