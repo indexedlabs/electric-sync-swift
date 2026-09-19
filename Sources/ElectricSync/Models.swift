@@ -141,6 +141,10 @@ public struct SyncState: Sendable {
   /// eager <-> progressive transitions. Nil everywhere else; states persisted
   /// before this field existed decode as nil and classify exactly as before.
   public let bridgedFromSyncMode: ElectricCollectionSyncMode?
+  /// The log mode that minted this handle. Providers must persist it atomically
+  /// with the cursor: full and changes_only are different server-side shapes.
+  /// Nil denotes legacy metadata whose mode is inferred from configuration.
+  public let logMode: ElectricLogMode?
 
   public init(
     offset: String?,
@@ -149,7 +153,8 @@ public struct SyncState: Sendable {
     isUpToDate: Bool,
     lastSyncedAt: Date?,
     protocolSemanticEpoch: ElectricProtocolSemanticEpoch = .legacy,
-    bridgedFromSyncMode: ElectricCollectionSyncMode? = nil
+    bridgedFromSyncMode: ElectricCollectionSyncMode? = nil,
+    logMode: ElectricLogMode? = nil
   ) {
     self.offset = offset
     self.handle = handle
@@ -158,6 +163,7 @@ public struct SyncState: Sendable {
     self.lastSyncedAt = lastSyncedAt
     self.protocolSemanticEpoch = protocolSemanticEpoch
     self.bridgedFromSyncMode = bridgedFromSyncMode
+    self.logMode = logMode
   }
 }
 
@@ -185,6 +191,7 @@ extension SyncState {
       && cursor == other.cursor
       && isUpToDate == other.isUpToDate
       && protocolSemanticEpoch == other.protocolSemanticEpoch
+      && logMode == other.logMode
   }
 
   public var canResumeWithoutFullBootstrap: Bool {

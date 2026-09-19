@@ -87,6 +87,7 @@ public struct SyncBatch<T: ElectricCollectionModel>: Sendable {
   private let isWireResetProjection: Bool
   private let replacesExclusiveWorkingSet: Bool
   private let isExternallyForcedFullBootstrap: Bool
+  private let requestLogMode: ElectricLogMode?
 
   fileprivate init(
     collectionIdentifier: String,
@@ -121,7 +122,8 @@ public struct SyncBatch<T: ElectricCollectionModel>: Sendable {
     protocolInputMessages: [ElectricMessage]? = nil,
     isWireResetProjection: Bool = false,
     replacesExclusiveWorkingSet: Bool = false,
-    isExternallyForcedFullBootstrap: Bool = false
+    isExternallyForcedFullBootstrap: Bool = false,
+    requestLogMode: ElectricLogMode? = nil
   ) {
     self.collectionIdentifier = collectionIdentifier
     self.streamStateKey = streamStateKey
@@ -161,6 +163,7 @@ public struct SyncBatch<T: ElectricCollectionModel>: Sendable {
     self.isWireResetProjection = isWireResetProjection
     self.replacesExclusiveWorkingSet = replacesExclusiveWorkingSet
     self.isExternallyForcedFullBootstrap = isExternallyForcedFullBootstrap
+    self.requestLogMode = requestLogMode
   }
 
   public struct Output: Sendable {
@@ -259,7 +262,8 @@ public struct SyncBatch<T: ElectricCollectionModel>: Sendable {
       protocolInputMessages: protocolInputMessages ?? self.protocolInputMessages,
       isWireResetProjection: isWireResetProjection ?? self.isWireResetProjection,
       replacesExclusiveWorkingSet: replacesExclusiveWorkingSet,
-      isExternallyForcedFullBootstrap: isExternallyForcedFullBootstrap
+      isExternallyForcedFullBootstrap: isExternallyForcedFullBootstrap,
+      requestLogMode: requestLogMode
     )
   }
 
@@ -945,7 +949,8 @@ public struct SyncBatch<T: ElectricCollectionModel>: Sendable {
           cursor: recordedCursor,
           isUpToDate: recordedIsUpToDate,
           lastSyncedAt: runtimeProvider.now(),
-          protocolSemanticEpoch: protocolSemanticEpoch
+          protocolSemanticEpoch: protocolSemanticEpoch,
+          logMode: requestLogMode ?? syncState?.logMode
         )
 
         let collisionReport = cursorOwnershipDiagnostics.cursorWriteCollisionReport(
@@ -2075,7 +2080,7 @@ public actor ElectricSyncClientImpl {
         live: false
       ).with(wireIdentity: replicaIdentity.wireIdentity)
 
-      request = request.with(log: logModeFor(syncMode: syncMode))
+      request = request.with(log: logModeFor(syncMode: syncMode, syncState: syncState))
 
       let messages: [ElectricMessage]
       let fetchCallCount: Int
@@ -2172,7 +2177,8 @@ public actor ElectricSyncClientImpl {
         runtimeProvider: runtimeProvider,
         shapeTopology: effectiveShapeTopology,
         shapeTopologyLatch: shapeTopologyLatch,
-        replacesExclusiveWorkingSet: replacesExclusiveWorkingSet
+        replacesExclusiveWorkingSet: replacesExclusiveWorkingSet,
+        requestLogMode: request.log ?? .full
       )
     }
   }
@@ -2521,7 +2527,9 @@ public actor ElectricSyncClientImpl {
       // This client never requests Electric experimental_compaction: rebuilding
       // continuity depends on the complete, ordered tag protocol.
       request = request.with(
-        log: logModeFor(syncMode: syncMode, forceFullBootstrap: forceFullBootstrap)
+        log: logModeFor(
+          syncMode: syncMode, syncState: syncState, forceFullBootstrap: forceFullBootstrap
+        )
       )
 
       let messages = try await fetchBufferedMessages(
@@ -2563,7 +2571,8 @@ public actor ElectricSyncClientImpl {
         runtimeProvider: runtimeProvider,
         shapeTopology: effectiveShapeTopology,
         shapeTopologyLatch: shapeTopologyLatch,
-        isExternallyForcedFullBootstrap: forceFullBootstrap
+        isExternallyForcedFullBootstrap: forceFullBootstrap,
+        requestLogMode: request.log ?? .full
       )
     }
   }
@@ -2665,7 +2674,7 @@ public actor ElectricSyncClientImpl {
         cursor: syncState?.cursor,
         live: true
       ).with(wireIdentity: replicaIdentity.wireIdentity)
-      request = request.with(log: logModeFor(syncMode: syncMode))
+      request = request.with(log: logModeFor(syncMode: syncMode, syncState: syncState))
 
       let messageStream: AsyncThrowingStream<ElectricMessage, Error>
       do {
@@ -2675,6 +2684,7 @@ public actor ElectricSyncClientImpl {
       }
       connectSpan.setAttribute(key: "result", value: "connected")
 
+      let requestLogMode = request.log ?? .full
       return AsyncThrowingStream { continuation in
         let metadataProvider = self.metadataProvider
         let eventHandler = self.eventHandler
@@ -2739,7 +2749,8 @@ public actor ElectricSyncClientImpl {
               protocolSemanticEpoch: protocolSemanticEpoch,
               runtimeProvider: runtimeProvider,
               shapeTopology: shapeTopology,
-              shapeTopologyLatch: shapeTopologyLatch
+              shapeTopologyLatch: shapeTopologyLatch,
+              requestLogMode: requestLogMode
             )
             let applicationBatch = batch.wireResetProjection()
             try applicationBatch.preflightSupportedEvents()
@@ -3032,12 +3043,16 @@ public actor ElectricSyncClientImpl {
 
   private func logModeFor(
     syncMode: ElectricCollectionSyncMode,
+    syncState: SyncState? = nil,
     forceFullBootstrap: Bool = false
   ) -> ElectricLogMode? {
-    // `changes_only` at `offset=-1` does not supply the baseline row keys an
-    // authoritative replacement needs. Keep the on-demand tail incremental,
-    // but let a forced bootstrap request Electric's normal full snapshot.
+    // Recovery needs a full snapshot. Its handle must remain on the full log
+    // afterwards: switching it back to changes_only changes shape identity and
+    // produces an endless 200-bootstrap / 409-tail loop (OTTO-3819).
     guard !forceFullBootstrap else { return nil }
+    if let logMode = syncState?.logMode {
+      return logMode == .full ? nil : logMode
+    }
     switch syncMode {
     case .onDemand:
       return .changesOnly
