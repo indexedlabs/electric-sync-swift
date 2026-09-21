@@ -34,6 +34,9 @@ Then add `ElectricSync` to your target dependencies:
 Implement the provider protocols appropriate to your application:
 
 - `MetadataProvider` persists Shape offsets, handles, cursors, fetch coverage, and row ownership.
+  Persist `SyncState.logMode` atomically with the handle and cursor, including across restarts.
+  Full and `changes_only` logs have distinct handles; recovery can promote an on-demand owner
+  to the full log. Legacy metadata may use `nil` until the owner next commits a response.
 - `DataCacheProvider` reads locally cached rows.
 - `HTTPClientProvider` performs one-shot and long-poll Shape requests.
 - `HTTPStreamClientProvider` opens live SSE streams.

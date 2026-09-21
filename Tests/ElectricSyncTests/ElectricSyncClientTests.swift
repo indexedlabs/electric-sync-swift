@@ -35,6 +35,73 @@ struct ElectricSyncClientTests {
   }
 
   @Test
+  func onDemandRecoveryKeepsFullLogHandleAcrossPollSubsetAndClientRestart() async throws {
+    // Electric includes log mode in shape identity. The incident cycled between
+    // a successful full bootstrap and a changes_only poll of that full handle.
+    let metadata = InMemoryMetadataProvider()
+    let store = TestRecordStore()
+    let http = InMemoryHTTPClientProvider(responses: [
+      [.upToDate(offset: "bootstrap")],
+      [.upToDate(offset: "tail")],
+      [.subsetEnd(offset: "subset")],
+      [.upToDate(offset: "restarted")],
+      [
+        .make(record: TestRecord(id: "reply", name: "Live reply"), offset: "live", key: "reply"),
+        .upToDate(offset: "live"),
+      ],
+    ])
+    let client = ElectricSyncClientImpl(
+      configuration: .init(
+        metadataProvider: metadata, httpClient: http
+      ))
+    let baseline = try #require(
+      try await client.pollStream(
+        TestRecord.self, basePredicate: nil, syncMode: .onDemand,
+        live: true, forceFullBootstrap: true
+      ))
+    try baseline.apply(in: store).transactionDidCommit()
+    let tail = try #require(
+      try await client.pollStream(
+        TestRecord.self, basePredicate: nil, syncMode: .onDemand, live: true
+      ))
+    try tail.apply(in: store).transactionDidCommit()
+    let subset = try #require(
+      try await client.requestSnapshot(
+        TestRecord.self, basePredicate: nil,
+        descriptor: QueryDescriptor(predicate: nil, orderBy: [], limit: 1),
+        syncMode: .onDemand, consultFetchCoverage: false
+      ))
+    try subset.apply(in: store).transactionDidCommit()
+    let restartedClient = ElectricSyncClientImpl(
+      configuration: .init(
+        metadataProvider: metadata, httpClient: http, httpStreamClient: http
+      ))
+    let restartedBatch = try #require(
+      try await restartedClient.pollStream(
+        TestRecord.self, basePredicate: nil, syncMode: .onDemand, live: true
+      ))
+    try restartedBatch.apply(in: store).transactionDidCommit()
+    let stream = try #require(
+      try await restartedClient.liveBatchStream(
+        TestRecord.self, basePredicate: nil, syncMode: .onDemand
+      ))
+    for try await batch in stream {
+      try batch.apply(in: store).transactionDidCommit()
+    }
+    #expect(store.record(id: "reply")?.name == "Live reply")
+    let requests = await http.capturedRequests()
+    try #require(requests.count == 5)
+    #expect(requests[4].handle == "handle-restarted")
+    #expect(requests[0].offset == "-1")
+    #expect(requests[1].handle == "handle-bootstrap")
+    #expect(requests[2].handle == "handle-tail")
+    #expect(requests[3].handle == "handle-subset")
+    for request in requests {
+      #expect(request.log != .changesOnly)
+    }
+  }
+
+  @Test
   func forcedFullBootstrapWaitsForUpToDateAfterSnapshotEnd() async throws {
     let stalePrefix = TestRecord(id: "user", name: "Not onboarded")
     let authoritativeRecord = TestRecord(id: "user", name: "Onboarded")
@@ -6078,7 +6145,7 @@ private struct OptimisticRetirementEvidence: Equatable, Sendable {
   let publications: Set<OptimisticPublicationEvidence>
 }
 
-private actor InMemoryHTTPClientProvider: HTTPClientProvider {
+private actor InMemoryHTTPClientProvider: HTTPClientProvider, HTTPStreamClientProvider {
   private var responses: [[ElectricMessage]]
   private var requests: [ElectricShapeRequest] = []
 
@@ -6090,6 +6157,16 @@ private actor InMemoryHTTPClientProvider: HTTPClientProvider {
     requests.append(request)
     guard !responses.isEmpty else { return [] }
     return responses.removeFirst()
+  }
+
+  func stream(_ request: ElectricShapeRequest) async throws -> AsyncThrowingStream<
+    ElectricMessage, Error
+  > {
+    let messages = try await fetch(request)
+    return AsyncThrowingStream { continuation in
+      for message in messages { continuation.yield(message) }
+      continuation.finish()
+    }
   }
 
   func requestCount() -> Int {
