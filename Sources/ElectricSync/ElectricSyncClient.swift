@@ -1675,10 +1675,10 @@ public actor ElectricSyncClientImpl {
     if ElectricLegacyBootstrapScope.admission?.identity == identity {
       return try await operation()
     }
-    guard try requiresLegacyBootstrapAdmission(identity: identity, syncMode: syncMode) else {
+    guard try await requiresLegacyBootstrapAdmission(identity: identity, syncMode: syncMode) else {
       return try await operation()
     }
-    let legacyCursorCount = try legacyCursorEvidenceCount(identity: identity)
+    let legacyCursorCount = try await legacyCursorEvidenceCount(identity: identity)
 
     return try await withAsyncSpan(
       name: "electric.legacy_bootstrap",
@@ -1709,7 +1709,29 @@ public actor ElectricSyncClientImpl {
         throw error
       }
 
-      if try !requiresLegacyBootstrapAdmission(identity: identity, syncMode: syncMode) {
+      let stillRequiresAdmission: Bool
+      do {
+        stillRequiresAdmission = try await requiresLegacyBootstrapAdmission(
+          identity: identity,
+          syncMode: syncMode
+        )
+      } catch {
+        // The slot is process-wide: finish it before rethrowing, or every later
+        // legacy bootstrap queues behind an admission nobody releases.
+        let isCancellation = error is CancellationError
+        let metrics = await controller.finish(
+          admission,
+          outcome: isCancellation ? .cancelled : .failed
+        )
+        Self.annotateLegacyBootstrapMetrics(metrics, span: span)
+        span.setAttribute(
+          key: "legacy_bootstrap.result",
+          value: isCancellation ? "cancelled" : "failed"
+        )
+        throw error
+      }
+
+      if !stillRequiresAdmission {
         let metrics = await controller.finish(admission, outcome: .supersededByExactState)
         Self.annotateLegacyBootstrapMetrics(metrics, span: span)
         span.setAttribute(key: "legacy_bootstrap.result", value: "superseded")
@@ -1720,20 +1742,16 @@ public actor ElectricSyncClientImpl {
         let output = try await ElectricLegacyBootstrapScope.$admission.withValue(admission) {
           try await operation()
         }
-        let cursorAdvanced = try {
-          if isExactCursorCutoverEnabled {
-            return try exactSyncState(identity: identity)?.canResumeWithoutFullBootstrap == true
-          }
-          guard let syncMode else { return false }
-          return try metadataProvider.getSyncState(
-            collectionId: identity.legacyPersistedCursorKey(syncMode: syncMode),
-            transaction: nil
-          )?.canResumeWithoutFullBootstrap == true
-        }()
-        let outcome: ElectricLegacyBootstrapOutcome =
-          expectsExactCursorAdvance
-          ? .completed(exactCursorAdvanced: cursorAdvanced)
-          : .completedWithoutCursorAdvance
+        let outcome: ElectricLegacyBootstrapOutcome
+        if expectsExactCursorAdvance {
+          let cursorAdvanced = try await admittedCursorAdvanced(
+            identity: identity,
+            syncMode: syncMode
+          )
+          outcome = .completed(exactCursorAdvanced: cursorAdvanced)
+        } else {
+          outcome = .completedWithoutCursorAdvance
+        }
         let metrics = await controller.finish(admission, outcome: outcome)
         Self.annotateLegacyBootstrapMetrics(metrics, span: span)
         span.setAttribute(key: "legacy_bootstrap.result", value: "completed")
@@ -1752,25 +1770,49 @@ public actor ElectricSyncClientImpl {
     }
   }
 
+  /// Every read here and in `withLegacyBootstrapAdmission` goes through the
+  /// provider's async `getSyncState(collectionId:)`. This actor runs on the
+  /// Swift concurrency pool, and a synchronous read that waits for a pooled
+  /// connection holds a pool thread for as long as every connection is
+  /// checked out (OTTO-5318).
   public func requiresLegacyBootstrapAdmission(
     identity: ElectricReplicaIdentity,
     syncMode: ElectricCollectionSyncMode? = nil
-  ) throws -> Bool {
+  ) async throws -> Bool {
     if !isExactCursorCutoverEnabled {
       if let syncMode,
-        try metadataProvider.getSyncState(
-          collectionId: identity.legacyPersistedCursorKey(syncMode: syncMode),
-          transaction: nil
+        try await metadataProvider.getSyncState(
+          collectionId: identity.legacyPersistedCursorKey(syncMode: syncMode)
         )?.canResumeWithoutFullBootstrap == true
       {
         return false
       }
-      return try legacyCursorEvidenceCount(identity: identity) > 0
+      return try await legacyCursorEvidenceCount(identity: identity) > 0
     }
-    let exactState = try exactSyncState(identity: identity)
+    let exactState = try await metadataProvider.getSyncState(
+      collectionId: identity.persistedCursorKey
+    )
     if exactState?.canResumeWithoutFullBootstrap == true { return false }
-    if exactState == nil, try provenLegacyResumeState(identity: identity) != nil { return false }
-    return try legacyCursorEvidenceCount(identity: identity) > 0
+    if exactState == nil, try await provenLegacyResumeState(identity: identity) != nil {
+      return false
+    }
+    return try await legacyCursorEvidenceCount(identity: identity) > 0
+  }
+
+  private func admittedCursorAdvanced(
+    identity: ElectricReplicaIdentity,
+    syncMode: ElectricCollectionSyncMode?
+  ) async throws -> Bool {
+    let cursorKey: String
+    if isExactCursorCutoverEnabled {
+      cursorKey = identity.persistedCursorKey
+    } else if let syncMode {
+      cursorKey = identity.legacyPersistedCursorKey(syncMode: syncMode)
+    } else {
+      return false
+    }
+    return try await metadataProvider.getSyncState(collectionId: cursorKey)?
+      .canResumeWithoutFullBootstrap == true
   }
 
   private nonisolated static func annotateLegacyBootstrapMetrics(
@@ -3188,18 +3230,25 @@ public actor ElectricSyncClientImpl {
     }
   }
 
-  private func legacyCursorEvidenceCount(identity: ElectricReplicaIdentity) throws -> Int {
-    try identity.legacyPersistedCursorKeys.reduce(into: 0) { count, key in
-      if try metadataProvider.getSyncState(collectionId: key, transaction: nil) != nil {
+  private func legacyCursorEvidenceCount(identity: ElectricReplicaIdentity) async throws -> Int {
+    var count = 0
+    for key in identity.legacyPersistedCursorKeys {
+      if try await metadataProvider.getSyncState(collectionId: key) != nil {
         count += 1
       }
     }
+    return count
   }
 
-  private func provenLegacyResumeState(identity: ElectricReplicaIdentity) throws -> SyncState? {
+  private func provenLegacyResumeState(
+    identity: ElectricReplicaIdentity
+  ) async throws -> SyncState? {
     guard !identity.provenLegacyPersistedCursorKeys.isEmpty else { return nil }
-    let states = try identity.provenLegacyPersistedCursorKeys.compactMap { key in
-      try metadataProvider.getSyncState(collectionId: key, transaction: nil)
+    var states: [SyncState] = []
+    for key in identity.provenLegacyPersistedCursorKeys {
+      if let state = try await metadataProvider.getSyncState(collectionId: key) {
+        states.append(state)
+      }
     }
     guard let first = states.first, first.canResumeWithoutFullBootstrap else { return nil }
     guard states.dropFirst().allSatisfy({ $0.hasSameResumeIdentity(as: first) }) else {

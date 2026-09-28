@@ -61,6 +61,12 @@ public protocol MetadataProvider: Sendable {
   ) throws
 
   func getSyncState(collectionId: String, transaction: Any?) throws -> SyncState?
+  /// Reads committed sync state outside any transaction without blocking the
+  /// calling thread. Legacy-bootstrap admission calls this from the client
+  /// actor, which runs on the Swift concurrency pool; a provider backed by a
+  /// connection pool must suspend while it waits for a connection instead of
+  /// blocking a pool thread. The default calls the synchronous requirement.
+  func getSyncState(collectionId: String) async throws -> SyncState?
   func updateSyncState(collectionId: String, state: SyncState, transaction: Any?) throws
   func resetSyncState(collectionId: String, transaction: Any?) throws
   /// Atomically adopts a proven-compatible legacy resume identity into `collectionId`.
@@ -191,6 +197,10 @@ extension MetadataProvider {
     outcome _: SubsetObservationOutcome,
     transaction _: Any?
   ) throws {}
+
+  public func getSyncState(collectionId: String) async throws -> SyncState? {
+    try getSyncState(collectionId: collectionId, transaction: nil)
+  }
 
   public func resetSyncState(collectionId: String, transaction: Any?) throws {
     // Default no-op; concrete providers can override.

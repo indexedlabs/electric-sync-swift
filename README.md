@@ -37,6 +37,9 @@ Implement the provider protocols appropriate to your application:
   Persist `SyncState.logMode` atomically with the handle and cursor, including across restarts.
   Full and `changes_only` logs have distinct handles; recovery can promote an on-demand owner
   to the full log. Legacy metadata may use `nil` until the owner next commits a response.
+  Implement the async `getSyncState(collectionId:)` so it suspends rather than blocks while it
+  waits for a pooled connection: legacy-bootstrap admission calls it from the Swift concurrency
+  pool. The default implementation calls the synchronous read.
 - `DataCacheProvider` reads locally cached rows.
 - `HTTPClientProvider` performs one-shot and long-poll Shape requests.
 - `HTTPStreamClientProvider` opens live SSE streams.
