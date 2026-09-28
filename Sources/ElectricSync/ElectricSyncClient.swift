@@ -1474,6 +1474,9 @@ public actor ElectricSyncClientImpl {
       return true
     } catch ElectricSyncError.trackerContinuityBootstrapRequired {
       throw ElectricSyncError.trackerContinuityBootstrapRequired
+    } catch let error as CancellationError {
+      // A cancelled read refused nothing: do not turn it into a replacement.
+      throw error
     } catch {
       throw ElectricSyncError.trackerContinuityBootstrapRequired
     }
@@ -1516,7 +1519,7 @@ public actor ElectricSyncClientImpl {
       shapeTopology,
       streamStateKey: streamStateKey
     )
-    let tracker: MoveOutTagTracker
+    let tracker = moveOutTracker(streamStateKey: streamStateKey)
     do {
       // resumeSyncState is inside the catch: it throws deterministically for
       // legacy-cursor devices without an exact cursor when no bootstrap
@@ -1537,9 +1540,6 @@ public actor ElectricSyncClientImpl {
       ) {
         return false
       }
-      // Look the tracker up after those reads: they suspend this actor, and a
-      // forced bootstrap may replace the stream's tracker meanwhile.
-      tracker = moveOutTracker(streamStateKey: streamStateKey)
       let rebuildAdmission = try await rebuildSimpleTrackerIfAdmissible(
         T.self,
         identity: identity,
@@ -1564,6 +1564,10 @@ public actor ElectricSyncClientImpl {
           ]
         )
       }
+    } catch let error as CancellationError {
+      // A cancelled precheck decides nothing: neither an admission error nor
+      // a recovery request.
+      throw error
     } catch {
       // Admission is an optimization. Any failed validation (resume, SQL,
       // malformed row key, or provider failure) is indistinguishable from a
@@ -1594,22 +1598,32 @@ public actor ElectricSyncClientImpl {
       return true
     }
 
-    guard !tracker.isContinuityEstablished else { return false }
+    // The reads above suspend this actor (OTTO-5325). If a forced bootstrap or
+    // restart replaced the tracker meanwhile, the rebuild refused the
+    // discarded one; answer for the tracker the stream now has.
+    guard !moveOutTracker(streamStateKey: streamStateKey).isContinuityEstablished else {
+      return false
+    }
+    // Likewise a batch may have latched the stream to DNF during those reads.
+    let currentShapeTopology = self.effectiveShapeTopology(
+      shapeTopology,
+      streamStateKey: streamStateKey
+    )
     // The explicit exclusive DNF policy is itself an admission contract: a
     // lost tracker must route through an active bounded demand so it can
     // replace the working set. It is neither the legacy statically-simple
     // rebuild nor permission to fall through to an unscoped full bootstrap.
     if recoveryPolicy == .replaceExclusiveWorkingSetFromDemandedSubsets,
       syncMode == .onDemand,
-      effectiveShapeTopology == .dnf
+      currentShapeTopology == .dnf
     {
       return true
     }
-    if requiresProcessTrackerContinuity(T.self, shapeTopology: effectiveShapeTopology) {
+    if requiresProcessTrackerContinuity(T.self, shapeTopology: currentShapeTopology) {
       return true
     }
     return semanticEpoch.isTaggedShapeCapabilityEnabled
-      && effectiveShapeTopology == .staticallySimple
+      && currentShapeTopology == .staticallySimple
   }
 
   func prefersDemandedSubsetResetForTrackerContinuity<T: ElectricCollectionModel>(
@@ -2032,6 +2046,11 @@ public actor ElectricSyncClientImpl {
         // tracker. The old generation is intentionally not resumable.
         moveOutTrackers[streamStateKey] = makeMoveOutTracker()
       }
+      // Take the tracker before the coverage and resume reads suspend this
+      // actor, as the synchronous reads did: a concurrent forced bootstrap or
+      // restart may install its own meanwhile, and this call keeps the one it
+      // installed or found (OTTO-5325).
+      let tracker = moveOutTracker(streamStateKey: streamStateKey)
 
       let fetchDescriptor: QueryDescriptor =
         if descriptor.cursor != nil {
@@ -2111,7 +2130,6 @@ public actor ElectricSyncClientImpl {
         ignorePersistedSyncState || restartOnDemandFromNow || admitsFreshOnDemandStaticSimple
         ? nil
         : resumedSyncState.state
-      let tracker = moveOutTracker(streamStateKey: streamStateKey)
       if !ignorePersistedSyncState, !restartOnDemandFromNow {
         _ = try await rebuildSimpleTrackerIfAdmissible(
           T.self,
@@ -2510,12 +2528,14 @@ public actor ElectricSyncClientImpl {
         // replacement generation.
         moveOutTrackers[streamStateKey] = makeMoveOutTracker()
       }
+      // Take the tracker before the resume reads suspend this actor; see
+      // `requestSnapshot`.
+      let tracker = moveOutTracker(streamStateKey: streamStateKey)
       let resumedSyncState = try await resumeSyncState(
         identity: replicaIdentity,
         syncMode: syncMode
       )
       span.setAttribute(key: "resume.source", value: resumedSyncState.source.rawValue)
-      let tracker = moveOutTracker(streamStateKey: streamStateKey)
       if !forceFullBootstrap {
         _ = try await rebuildSimpleTrackerIfAdmissible(
           T.self,
@@ -2707,13 +2727,15 @@ public actor ElectricSyncClientImpl {
         shapeTopology,
         streamStateKey: streamStateKey
       )
+      // Take the tracker before the resume reads suspend this actor; see
+      // `requestSnapshot`.
+      let tracker = moveOutTracker(streamStateKey: streamStateKey)
       let resumedSyncState = try await resumeSyncState(
         identity: replicaIdentity,
         syncMode: syncMode
       )
       connectSpan.setAttribute(key: "resume.source", value: resumedSyncState.source.rawValue)
       let syncState = resumedSyncState.state
-      let tracker = moveOutTracker(streamStateKey: streamStateKey)
       _ = try await rebuildSimpleTrackerIfAdmissible(
         T.self,
         identity: replicaIdentity,

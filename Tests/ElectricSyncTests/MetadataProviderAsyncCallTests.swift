@@ -8,6 +8,10 @@ import Testing
 /// fetch coverage, batch preflight, legacy adoption, `markFetched`) ran the
 /// provider's synchronous requirements on the Swift concurrency pool. With a
 /// GRDB pool, each one parked its thread until a reader or the writer was free.
+///
+/// Serialized so a regression parks at most one pool thread at a time instead
+/// of stalling unrelated tests for the length of a hold.
+@Suite(.serialized)
 struct MetadataProviderAsyncCallTests {
   private static let identity = ElectricReplicaIdentity(
     modelType: ReplicaTestRecord.self,
@@ -66,27 +70,19 @@ struct MetadataProviderAsyncCallTests {
     let readsBeforePreflight = metadata.callCounts.readsStarted
 
     // Preflight runs from the live-stream task, the collection owner and the
-    // query coordinator actor, not on the client actor. What a blocking read
-    // costs there is a cooperative-pool thread: start more preflights than the
-    // pool has threads, then check other async work still runs.
-    let preflightCount = ProcessInfo.processInfo.activeProcessorCount * 2
+    // query coordinator actor, not on the client actor, so there is no actor
+    // to probe: the provider counts a synchronous read made without a
+    // transaction, which holds its pool thread until the reader returns.
     let heldReader = await HeldConnection.reader(of: store.database, releasingAfter: .seconds(8))
-    let preflights = (0..<preflightCount).map { _ in
-      Task.detached { try await batch.preflightSupportedEvents() }
-    }
-    try await waitUntil {
-      metadata.callCounts.readsStarted - readsBeforePreflight >= preflightCount
-    }
-
-    let probeRanWhileReaderWasHeld = await Task.detached { !heldReader.isReleased }.value
-    #expect(probeRanWhileReaderWasHeld)
+    let preflight = Task.detached { try await batch.preflightSupportedEvents() }
+    try await waitUntil { metadata.callCounts.readsStarted > readsBeforePreflight }
     #expect(metadata.callCounts.blocking == 0)
+    #expect(!heldReader.isReleased)
 
     heldReader.release()
-    for preflight in preflights {
-      try await preflight.value
-    }
-    #expect(metadata.callCounts.readsStarted - readsBeforePreflight == preflightCount)
+    try await preflight.value
+    // Every preflight check uses the one read of the stream's state.
+    #expect(metadata.callCounts.readsStarted - readsBeforePreflight == 1)
     #expect(metadata.callCounts.blocking == 0)
   }
 
@@ -115,6 +111,50 @@ struct MetadataProviderAsyncCallTests {
     let fetchPlan = try await plan.value
     #expect(!fetchPlan.needsFetch)
     #expect(fetchPlan.reuseExisting)
+    #expect(metadata.callCounts.blocking == 0)
+  }
+
+  @Test
+  func fetchCoverageMissSuspendsThroughEveryCoverageRead() async throws {
+    let store = try TemporaryPool()
+    let metadata = try PooledMetadataProvider(database: store.database)
+    let fetched = ElectricFetchTracker.metadataKey(
+      predicate: SQLExpression(
+        predicate: .comparison(field: "age", op: .greaterThan, value: .int(20))
+      ),
+      orderBy: [],
+      limit: nil
+    )
+    try metadata.seedFetch(
+      table: ReplicaTestRecord.tableName,
+      predicate: fetched.predicateHash,
+      predicateJSON: fetched.predicateJSON
+    )
+    let tracker = ElectricFetchTracker(metadataProvider: metadata)
+
+    let heldReader = await HeldConnection.reader(of: store.database, releasingAfter: .seconds(8))
+    let plan = Task {
+      try await tracker.computeMissing(
+        table: ReplicaTestRecord.tableName,
+        requested: SQLExpression(
+          predicate: .comparison(field: "age", op: .greaterThan, value: .int(10))
+        ),
+        scope: nil,
+        orderBy: [OrderBy(field: "age")],
+        limit: 5
+      )
+    }
+    try await waitUntil { metadata.callCounts.readsStarted > 0 }
+    #expect(metadata.callCounts.blocking == 0)
+    #expect(!heldReader.isReleased)
+
+    heldReader.release()
+    // The unscoped and the limit-scoped coverage reads miss. Only the seeded
+    // predicate, read back through getFetchedPredicates, narrows the fetch.
+    let fetchPlan = try await plan.value
+    #expect(fetchPlan.needsFetch)
+    #expect(fetchPlan.predicate?.predicate?.canonicalDescription() == "age > 10 AND age <= 20")
+    #expect(metadata.callCounts.readsStarted == 3)
     #expect(metadata.callCounts.blocking == 0)
   }
 
@@ -190,7 +230,8 @@ struct MetadataProviderAsyncCallTests {
   @Test
   func trackerRebuildRefusesATrackerReplacedDuringItsOwnershipRead() async throws {
     let identity = Self.identity
-    let metadata = GatedRebuildMetadataProvider(
+    let metadata = GatedMetadataProvider(
+      gating: .rebuildOwnershipRead,
       states: [identity.persistedCursorKey: .resumableState(offset: "exact-offset")]
     )
     let client = makeClient(metadata: metadata, http: UpToDateHTTPClient())
@@ -204,7 +245,7 @@ struct MetadataProviderAsyncCallTests {
         live: false
       )
     }
-    try await waitUntil { metadata.isHoldingFirstRebuildRead }
+    try await waitUntil { metadata.isHoldingFirstCall }
 
     let forced = try #require(
       try await client.pollStream(
@@ -216,7 +257,7 @@ struct MetadataProviderAsyncCallTests {
         forceFullBootstrap: true
       )
     )
-    metadata.openFirstRebuildRead()
+    metadata.openGate()
     let resumedBatch = try #require(try await resumed.value)
 
     #expect(resumedBatch.moveOutTracker !== forced.moveOutTracker)
@@ -238,15 +279,124 @@ struct MetadataProviderAsyncCallTests {
     #expect(later.moveOutTracker.isContinuityEstablished)
   }
 
+  /// The resume reads suspend the client actor. A forced bootstrap keeps the
+  /// tracker it installed even when another forced bootstrap installs its own
+  /// during those reads: two replacements never share one tracker, so one
+  /// failing cannot reset the other's.
+  @Test
+  func forcedBootstrapKeepsItsTrackerWhenAnotherReplacesItDuringResume() async throws {
+    let identity = Self.identity
+    let metadata = GatedMetadataProvider(
+      gating: .syncStateRead,
+      states: [identity.persistedCursorKey: .resumableState(offset: "exact-offset")]
+    )
+    let client = makeClient(metadata: metadata, http: UpToDateHTTPClient())
+
+    let first = Task {
+      try await client.pollStream(
+        ReplicaTestRecord.self,
+        basePredicate: nil,
+        syncMode: .eager,
+        live: false,
+        forceFullBootstrap: true
+      )
+    }
+    try await waitUntil { metadata.isHoldingFirstCall }
+
+    let second = try #require(
+      try await client.pollStream(
+        ReplicaTestRecord.self,
+        basePredicate: nil,
+        syncMode: .eager,
+        live: false,
+        forceFullBootstrap: true
+      )
+    )
+    metadata.openGate()
+    let firstBatch = try #require(try await first.value)
+
+    #expect(firstBatch.moveOutTracker !== second.moveOutTracker)
+    // The later installation is the stream's tracker from here on.
+    let later = try #require(
+      try await client.pollStream(
+        ReplicaTestRecord.self,
+        basePredicate: nil,
+        syncMode: .eager,
+        live: false
+      )
+    )
+    #expect(later.moveOutTracker === second.moveOutTracker)
+  }
+
+  /// After a rebuild refuses a tracker replaced during its ownership read, the
+  /// continuity precheck answers for the stream's current tracker. Here the
+  /// replacement already has continuity, so no second bootstrap is needed;
+  /// the discarded tracker would have asked for one (tagged, simple shape).
+  @Test
+  func continuityPrecheckAnswersForTheTrackerThatReplacedItsOwn() async throws {
+    let identity = Self.identity
+    let metadata = GatedMetadataProvider(
+      gating: .rebuildOwnershipRead,
+      states: [
+        identity.persistedCursorKey: .resumableState(
+          offset: "exact-offset",
+          protocolSemanticEpoch: .taggedShape1_7_7
+        )
+      ]
+    )
+    let client = makeClient(
+      metadata: metadata,
+      http: UpToDateHTTPClient(),
+      protocolCapabilityPolicy: .enabled
+    )
+
+    let precheck = Task {
+      try await client.requiresFullBootstrapForTrackerContinuity(
+        ReplicaTestRecord.self,
+        identity: identity,
+        syncMode: .eager,
+        shapeTopology: .staticallySimple
+      )
+    }
+    try await waitUntil { metadata.isHoldingFirstCall }
+
+    let forced = try #require(
+      try await client.pollStream(
+        ReplicaTestRecord.self,
+        basePredicate: nil,
+        shapeTopology: .staticallySimple,
+        syncMode: .eager,
+        live: false,
+        forceFullBootstrap: true
+      )
+    )
+    let resumed = try #require(
+      try await client.pollStream(
+        ReplicaTestRecord.self,
+        basePredicate: nil,
+        shapeTopology: .staticallySimple,
+        syncMode: .eager,
+        live: false
+      )
+    )
+    #expect(resumed.moveOutTracker === forced.moveOutTracker)
+    #expect(forced.moveOutTracker.isContinuityEstablished)
+
+    metadata.openGate()
+    #expect(try await precheck.value == false)
+  }
+
   private func makeClient(
     metadata: MetadataProvider,
-    http: HTTPClientProvider
+    http: HTTPClientProvider,
+    protocolCapabilityPolicy: ElectricProtocolCapabilityPolicy = .defaultOff
   ) -> ElectricSyncClientImpl {
     ElectricSyncClientImpl(
       configuration: ElectricSyncClientConfiguration(
         metadataProvider: metadata,
         httpClient: http,
-        isExactCursorCutoverEnabled: true
+        isExactCursorCutoverEnabled: true,
+        protocolCapabilityPolicy: protocolCapabilityPolicy
       )
     )
   }
@@ -279,13 +429,17 @@ private struct LegacyCursorTestRecord: ReplicaLifecycleTestModel {
 }
 
 extension SyncState {
-  fileprivate static func resumableState(offset: String) -> SyncState {
+  fileprivate static func resumableState(
+    offset: String,
+    protocolSemanticEpoch: ElectricProtocolSemanticEpoch = .legacy
+  ) -> SyncState {
     SyncState(
       offset: offset,
       handle: "handle",
       cursor: "cursor",
       isUpToDate: true,
-      lastSyncedAt: nil
+      lastSyncedAt: nil,
+      protocolSemanticEpoch: protocolSemanticEpoch
     )
   }
 }
@@ -353,9 +507,9 @@ private final class PooledMetadataProvider: MetadataProvider, @unchecked Sendabl
     try database.write { try Self.save(state, collectionId: collectionId, db: $0) }
   }
 
-  func seedFetch(table: String, predicate: PredicateHash) throws {
+  func seedFetch(table: String, predicate: PredicateHash, predicateJSON: String? = nil) throws {
     try database.write {
-      try Self.saveFetch(table: table, predicate: predicate, predicateJSON: nil, db: $0)
+      try Self.saveFetch(table: table, predicate: predicate, predicateJSON: predicateJSON, db: $0)
     }
   }
 
@@ -596,31 +750,59 @@ private final class PooledMetadataProvider: MetadataProvider, @unchecked Sendabl
 }
 
 /// Serves fixed sync state, claims durable row ownership, and holds the first
-/// tracker-rebuild ownership read until the test opens it.
-private final class GatedRebuildMetadataProvider: MetadataProvider, @unchecked Sendable {
+/// async call of one kind until the test opens the gate.
+private final class GatedMetadataProvider: MetadataProvider, @unchecked Sendable {
+  enum GatedCall {
+    case syncStateRead
+    case rebuildOwnershipRead
+  }
+
   let supportsDurableRowOwnership = true
 
+  private let gatedCall: GatedCall
   private let lock = NSLock()
   private var states: [String: SyncState]
-  private var rebuildReads = 0
-  private var firstReadGate: CheckedContinuation<Void, Never>?
-  private var isFirstReadOpen = false
+  private var gatedCallCount = 0
+  private var gate: CheckedContinuation<Void, Never>?
+  private var isGateOpen = false
 
-  init(states: [String: SyncState]) {
+  init(gating gatedCall: GatedCall, states: [String: SyncState]) {
+    self.gatedCall = gatedCall
     self.states = states
   }
 
-  var isHoldingFirstRebuildRead: Bool {
-    lock.withLock { firstReadGate != nil }
+  var isHoldingFirstCall: Bool {
+    lock.withLock { gate != nil }
   }
 
-  func openFirstRebuildRead() {
-    let gate = lock.withLock {
-      isFirstReadOpen = true
-      defer { firstReadGate = nil }
-      return firstReadGate
+  func openGate() {
+    let waiter = lock.withLock {
+      isGateOpen = true
+      defer { gate = nil }
+      return gate
     }
-    gate?.resume()
+    waiter?.resume()
+  }
+
+  private func pass(_ call: GatedCall) async {
+    guard call == gatedCall else { return }
+    let isFirstCall = lock.withLock {
+      gatedCallCount += 1
+      return gatedCallCount == 1
+    }
+    guard isFirstCall else { return }
+    await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+      let isOpen = lock.withLock {
+        if !isGateOpen { gate = continuation }
+        return isGateOpen
+      }
+      if isOpen { continuation.resume() }
+    }
+  }
+
+  func getSyncState(collectionId: String) async throws -> SyncState? {
+    await pass(.syncStateRead)
+    return lock.withLock { states[collectionId] }
   }
 
   func trackerRebuildOwnership(
@@ -628,19 +810,7 @@ private final class GatedRebuildMetadataProvider: MetadataProvider, @unchecked S
     shapeIdentity _: String,
     localTableOwnership _: ElectricLocalTableOwnership
   ) async throws -> [String: [String]]? {
-    let isFirstRead = lock.withLock {
-      rebuildReads += 1
-      return rebuildReads == 1
-    }
-    if isFirstRead {
-      await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-        let isOpen = lock.withLock {
-          if !isFirstReadOpen { firstReadGate = continuation }
-          return isFirstReadOpen
-        }
-        if isOpen { continuation.resume() }
-      }
-    }
+    await pass(.rebuildOwnershipRead)
     return [:]
   }
 
@@ -649,8 +819,7 @@ private final class GatedRebuildMetadataProvider: MetadataProvider, @unchecked S
     shapeIdentity _: String,
     transaction _: Any?
   ) throws -> [String: [String]]? {
-    lock.withLock { rebuildReads += 1 }
-    return [:]
+    [:]
   }
 
   func getSyncState(collectionId: String, transaction _: Any?) throws -> SyncState? {
