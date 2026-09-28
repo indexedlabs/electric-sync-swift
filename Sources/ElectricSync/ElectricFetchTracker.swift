@@ -34,10 +34,11 @@ public actor ElectricFetchTracker {
     )
     let unscopedKey = Self.metadataKey(predicate: effectiveRequested, orderBy: [], limit: nil)
 
-    if try metadataProvider.hasFetched(
+    // Coverage reads run outside any transaction on this actor, which runs on
+    // the Swift concurrency pool: use the provider's async reads (OTTO-5325).
+    if try await metadataProvider.hasFetched(
       table: table,
-      predicate: unscopedKey.predicateHash,
-      transaction: nil
+      predicate: unscopedKey.predicateHash
     ) {
       return FetchPlan(
         needsFetch: false,
@@ -53,10 +54,9 @@ public actor ElectricFetchTracker {
         orderBy: orderBy,
         limit: limit
       )
-      if try metadataProvider.hasFetched(
+      if try await metadataProvider.hasFetched(
         table: table,
-        predicate: scopedKey.predicateHash,
-        transaction: nil
+        predicate: scopedKey.predicateHash
       ) {
         return FetchPlan(
           needsFetch: false,
@@ -67,7 +67,7 @@ public actor ElectricFetchTracker {
       }
     }
 
-    let fetched = try metadataProvider.getFetchedPredicates(table: table, transaction: nil)
+    let fetched = try await metadataProvider.getFetchedPredicates(table: table)
       .filter { !Self.isScopedPredicate($0.predicateHash) }
     if let effectiveRequested {
       let missingPredicate = predicateAnalyzer.computeMissing(

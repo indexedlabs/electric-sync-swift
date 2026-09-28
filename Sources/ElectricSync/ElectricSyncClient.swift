@@ -314,10 +314,17 @@ public struct SyncBatch<T: ElectricCollectionModel>: Sendable {
 
   private func needsSemanticEpochReset(transactionContext: Any?) throws -> Bool {
     if requiresSemanticEpochReset { return true }
-    if let persistedEpoch = try metadataProvider.getSyncState(
-      collectionId: streamStateKey,
-      transaction: transactionContext
-    )?.protocolSemanticEpoch,
+    return try needsSemanticEpochReset(
+      persistedState: metadataProvider.getSyncState(
+        collectionId: streamStateKey,
+        transaction: transactionContext
+      )
+    )
+  }
+
+  private func needsSemanticEpochReset(persistedState: SyncState?) -> Bool {
+    if requiresSemanticEpochReset { return true }
+    if let persistedEpoch = persistedState?.protocolSemanticEpoch,
       persistedEpoch != protocolSemanticEpoch
     {
       return true
@@ -331,7 +338,24 @@ public struct SyncBatch<T: ElectricCollectionModel>: Sendable {
   }
 
   private func preflightSupportedEvents(transactionContext: Any?) throws {
-    if try needsSemanticEpochReset(transactionContext: transactionContext) {
+    let persistedState: SyncState? =
+      if requiresSemanticEpochReset {
+        nil
+      } else {
+        try metadataProvider.getSyncState(
+          collectionId: streamStateKey,
+          transaction: transactionContext
+        )
+      }
+    try preflightSupportedEvents(persistedState: persistedState)
+  }
+
+  /// Every check reads the same persisted state, so one read serves them all:
+  /// inside the owner transaction the separate reads were identical, and
+  /// outside it one read cannot mix two committed states. With
+  /// `requiresSemanticEpochReset` the state is never consulted.
+  private func preflightSupportedEvents(persistedState: SyncState?) throws {
+    if needsSemanticEpochReset(persistedState: persistedState) {
       guard shouldPersistSyncState || persistSyncStateOnlyAtTerminalBoundary else {
         throw ElectricSyncError.capabilitySemanticEpochTransitionDeferred
       }
@@ -342,10 +366,7 @@ public struct SyncBatch<T: ElectricCollectionModel>: Sendable {
     // establish tracker continuity from partial data before the atomic swap.
     if !shouldPersistSyncState,
       !persistSyncStateOnlyAtTerminalBoundary,
-      try metadataProvider.getSyncState(
-        collectionId: streamStateKey,
-        transaction: transactionContext
-      ).map({ !$0.canResumeWithoutFullBootstrap }) == true
+      persistedState.map({ !$0.canResumeWithoutFullBootstrap }) == true
     {
       throw ElectricSyncError.capabilitySemanticEpochTransitionDeferred
     }
@@ -354,10 +375,7 @@ public struct SyncBatch<T: ElectricCollectionModel>: Sendable {
       !metadataProvider.supportsDurableRowOwnership || taggedShapeCapabilityEnabled
     if continuityFenceApplies,
       !moveOutTracker.isContinuityEstablished,
-      try metadataProvider.getSyncState(
-        collectionId: streamStateKey,
-        transaction: transactionContext
-      )?.canResumeWithoutFullBootstrap == true,
+      persistedState?.canResumeWithoutFullBootstrap == true,
       protocolInputMessages.contains(where: Self.isTaggedProtocolInput),
       !(shouldPersistSyncState || persistSyncStateOnlyAtTerminalBoundary)
     {
@@ -371,8 +389,20 @@ public struct SyncBatch<T: ElectricCollectionModel>: Sendable {
     }
   }
 
-  func preflightSupportedEvents() throws {
-    try preflightSupportedEvents(transactionContext: nil)
+  /// The early check before a batch reaches its owner transaction. Callers run
+  /// on the Swift concurrency pool (the live stream task, the collection
+  /// owner, the query coordinator actor), so the read goes through the
+  /// provider's async requirement instead of waiting for a pooled connection
+  /// on a pool thread (OTTO-5325). `apply(in:)` repeats the check inside the
+  /// transaction as the final fence.
+  func preflightSupportedEvents() async throws {
+    let persistedState: SyncState? =
+      if requiresSemanticEpochReset {
+        nil
+      } else {
+        try await metadataProvider.getSyncState(collectionId: streamStateKey)
+      }
+    try preflightSupportedEvents(persistedState: persistedState)
   }
 
   /// Applies the sync batch to the local database.
@@ -1346,7 +1376,7 @@ public actor ElectricSyncClientImpl {
     syncMode: ElectricCollectionSyncMode,
     tracker: MoveOutTagTracker,
     semanticEpoch: ElectricProtocolSemanticEpoch
-  ) throws -> SimpleTrackerRebuildAdmission {
+  ) async throws -> SimpleTrackerRebuildAdmission {
     guard metadataProvider.supportsDurableRowOwnership else {
       return .refused(reason: "durable_row_ownership_unsupported")
     }
@@ -1387,14 +1417,28 @@ public actor ElectricSyncClientImpl {
       return .alreadyEstablished
     }
     guard
-      let tags = try metadataProvider.trackerRebuildOwnership(
+      let tags = try await metadataProvider.trackerRebuildOwnership(
         table: T.tableName,
         shapeIdentity: ownershipShapeIdentity,
-        localTableOwnership: T.electricLocalTableOwnership,
-        transaction: nil
+        localTableOwnership: T.electricLocalTableOwnership
       )
     else {
       return .refused(reason: "local_ownership_validation_refused")
+    }
+    // The ownership read suspends this actor (OTTO-5325). Meanwhile another
+    // call may have replaced this stream's tracker for a forced bootstrap or an
+    // on-demand restart, established its continuity, or latched the stream to
+    // DNF. Rebuilding then would resume a discarded generation or overwrite
+    // newer membership, so re-check before touching the tracker.
+    let streamStateKey = persistedCursorKey(identity: identity, syncMode: syncMode)
+    guard moveOutTrackers[streamStateKey] === tracker else {
+      return .refused(reason: "tracker_replaced_during_rebuild")
+    }
+    guard !tracker.isContinuityEstablished else {
+      return .alreadyEstablished
+    }
+    guard !shapeTopologyLatch.hasLatchedDNFSemantics(for: streamStateKey) else {
+      return .refused(reason: "shape_topology_not_statically_simple")
     }
     tracker.rebuildSimpleMembership(tags, taggedMode: semanticEpoch.isTaggedShapeCapabilityEnabled)
     return .admitted
@@ -1405,7 +1449,7 @@ public actor ElectricSyncClientImpl {
     resumedState: ResumedSyncState,
     syncMode: ElectricCollectionSyncMode,
     shapeTopology: ElectricShapeTopology
-  ) throws -> Bool {
+  ) async throws -> Bool {
     guard
       syncMode == .onDemand
         && shapeTopology == .staticallySimple
@@ -1420,10 +1464,9 @@ public actor ElectricSyncClientImpl {
     // authoritative replacement instead.
     do {
       guard
-        try metadataProvider.admitsFreshOnDemandPristineOwner(
+        try await metadataProvider.admitsFreshOnDemandPristineOwner(
           table: T.tableName,
-          localTableOwnership: T.electricLocalTableOwnership,
-          transaction: nil
+          localTableOwnership: T.electricLocalTableOwnership
         )
       else {
         throw ElectricSyncError.trackerContinuityBootstrapRequired
@@ -1431,6 +1474,9 @@ public actor ElectricSyncClientImpl {
       return true
     } catch ElectricSyncError.trackerContinuityBootstrapRequired {
       throw ElectricSyncError.trackerContinuityBootstrapRequired
+    } catch let error as CancellationError {
+      // A cancelled read refused nothing: do not turn it into a replacement.
+      throw error
     } catch {
       throw ElectricSyncError.trackerContinuityBootstrapRequired
     }
@@ -1466,7 +1512,7 @@ public actor ElectricSyncClientImpl {
     syncMode: ElectricCollectionSyncMode,
     shapeTopology: ElectricShapeTopology,
     recoveryPolicy: ElectricTrackerContinuityRecoveryPolicy = .fullBootstrap
-  ) throws -> Bool {
+  ) async throws -> Bool {
     let semanticEpoch = protocolCapabilityPolicy.semanticEpoch()
     let streamStateKey = persistedCursorKey(identity: identity, syncMode: syncMode)
     let effectiveShapeTopology = effectiveShapeTopology(
@@ -1480,13 +1526,13 @@ public actor ElectricSyncClientImpl {
       // admission is bound (legacyExactMissBootstrapDisabled), and this
       // precheck runs before the owner flow binds one. An escaped throw here
       // kills the detached owner task for the whole session.
-      let resumedState = try resumeSyncState(identity: identity, syncMode: syncMode)
+      let resumedState = try await resumeSyncState(identity: identity, syncMode: syncMode)
       // A fresh on-demand static-simple owner has no prior generation whose
       // tracker or rows need replacement. Its first subset is the baseline;
       // forcing an unscoped bootstrap here would violate on-demand's
       // snapshot-first contract. This deliberately excludes exact, adopted,
       // legacy-miss, and DNF state, which remain fail-closed below.
-      if try admitsFreshOnDemandStaticSimple(
+      if try await admitsFreshOnDemandStaticSimple(
         T.self,
         resumedState: resumedState,
         syncMode: syncMode,
@@ -1494,7 +1540,7 @@ public actor ElectricSyncClientImpl {
       ) {
         return false
       }
-      let rebuildAdmission = try rebuildSimpleTrackerIfAdmissible(
+      let rebuildAdmission = try await rebuildSimpleTrackerIfAdmissible(
         T.self,
         identity: identity,
         resumedState: resumedState,
@@ -1518,6 +1564,10 @@ public actor ElectricSyncClientImpl {
           ]
         )
       }
+    } catch let error as CancellationError {
+      // A cancelled precheck decides nothing: neither an admission error nor
+      // a recovery request.
+      throw error
     } catch {
       // Admission is an optimization. Any failed validation (resume, SQL,
       // malformed row key, or provider failure) is indistinguishable from a
@@ -1548,22 +1598,32 @@ public actor ElectricSyncClientImpl {
       return true
     }
 
-    guard !tracker.isContinuityEstablished else { return false }
+    // The reads above suspend this actor (OTTO-5325). If a forced bootstrap or
+    // restart replaced the tracker meanwhile, the rebuild refused the
+    // discarded one; answer for the tracker the stream now has.
+    guard !moveOutTracker(streamStateKey: streamStateKey).isContinuityEstablished else {
+      return false
+    }
+    // Likewise a batch may have latched the stream to DNF during those reads.
+    let currentShapeTopology = self.effectiveShapeTopology(
+      shapeTopology,
+      streamStateKey: streamStateKey
+    )
     // The explicit exclusive DNF policy is itself an admission contract: a
     // lost tracker must route through an active bounded demand so it can
     // replace the working set. It is neither the legacy statically-simple
     // rebuild nor permission to fall through to an unscoped full bootstrap.
     if recoveryPolicy == .replaceExclusiveWorkingSetFromDemandedSubsets,
       syncMode == .onDemand,
-      effectiveShapeTopology == .dnf
+      currentShapeTopology == .dnf
     {
       return true
     }
-    if requiresProcessTrackerContinuity(T.self, shapeTopology: effectiveShapeTopology) {
+    if requiresProcessTrackerContinuity(T.self, shapeTopology: currentShapeTopology) {
       return true
     }
     return semanticEpoch.isTaggedShapeCapabilityEnabled
-      && effectiveShapeTopology == .staticallySimple
+      && currentShapeTopology == .staticallySimple
   }
 
   func prefersDemandedSubsetResetForTrackerContinuity<T: ElectricCollectionModel>(
@@ -1986,6 +2046,11 @@ public actor ElectricSyncClientImpl {
         // tracker. The old generation is intentionally not resumable.
         moveOutTrackers[streamStateKey] = makeMoveOutTracker()
       }
+      // Take the tracker before the coverage and resume reads suspend this
+      // actor, as the synchronous reads did: a concurrent forced bootstrap or
+      // restart may install its own meanwhile, and this call keeps the one it
+      // installed or found (OTTO-5325).
+      let tracker = moveOutTracker(streamStateKey: streamStateKey)
 
       let fetchDescriptor: QueryDescriptor =
         if descriptor.cursor != nil {
@@ -2021,19 +2086,17 @@ public actor ElectricSyncClientImpl {
           orderBy: [],
           limit: nil
         ).predicateHash
-        if try metadataProvider.hasFetched(
+        if try await metadataProvider.hasFetched(
           table: T.tableName,
-          predicate: unscopedKey,
-          transaction: nil
+          predicate: unscopedKey
         ) {
           span.setAttribute(key: "result", value: "skipped_cursor_unscoped_cached")
           return nil
         }
 
-        if try metadataProvider.hasFetched(
+        if try await metadataProvider.hasFetched(
           table: T.tableName,
-          predicate: fetchMetadataKey.predicateHash,
-          transaction: nil
+          predicate: fetchMetadataKey.predicateHash
         ) {
           span.setAttribute(key: "result", value: "skipped_cursor_scoped_cached")
           return nil
@@ -2044,7 +2107,7 @@ public actor ElectricSyncClientImpl {
       // stream identity: this batch does not own that state (the live stream
       // owner resets it), so re-reading it would replay the same invalidated
       // offset/handle/cursor and repeat the truncate. Fetch like a first load.
-      let resumedSyncState = try resumeSyncState(
+      let resumedSyncState = try await resumeSyncState(
         identity: replicaIdentity,
         syncMode: syncMode
       )
@@ -2053,7 +2116,7 @@ public actor ElectricSyncClientImpl {
         if restartOnDemandFromNow {
           false
         } else {
-          try admitsFreshOnDemandStaticSimple(
+          try await admitsFreshOnDemandStaticSimple(
             T.self,
             resumedState: resumedSyncState,
             syncMode: syncMode,
@@ -2067,9 +2130,8 @@ public actor ElectricSyncClientImpl {
         ignorePersistedSyncState || restartOnDemandFromNow || admitsFreshOnDemandStaticSimple
         ? nil
         : resumedSyncState.state
-      let tracker = moveOutTracker(streamStateKey: streamStateKey)
       if !ignorePersistedSyncState, !restartOnDemandFromNow {
-        _ = try rebuildSimpleTrackerIfAdmissible(
+        _ = try await rebuildSimpleTrackerIfAdmissible(
           T.self,
           identity: replicaIdentity,
           resumedState: resumedSyncState,
@@ -2229,7 +2291,7 @@ public actor ElectricSyncClientImpl {
     table: String,
     basePredicate: SQLExpression?,
     descriptor: QueryDescriptor
-  ) throws -> SubsetObservation? {
+  ) async throws -> SubsetObservation? {
     let predicate = ElectricFetchTracker.combinedCoveragePredicate(
       scope: basePredicate,
       requested: descriptor.predicate
@@ -2240,10 +2302,9 @@ public actor ElectricSyncClientImpl {
       limit: descriptor.limit,
       cursor: descriptor.cursor
     )
-    return try metadataProvider.getLatestObservation(
+    return try await metadataProvider.getLatestObservation(
       table: table,
-      predicate: metadataKey.predicateHash,
-      transaction: nil
+      predicate: metadataKey.predicateHash
     )
   }
 
@@ -2467,14 +2528,16 @@ public actor ElectricSyncClientImpl {
         // replacement generation.
         moveOutTrackers[streamStateKey] = makeMoveOutTracker()
       }
-      let resumedSyncState = try resumeSyncState(
+      // Take the tracker before the resume reads suspend this actor; see
+      // `requestSnapshot`.
+      let tracker = moveOutTracker(streamStateKey: streamStateKey)
+      let resumedSyncState = try await resumeSyncState(
         identity: replicaIdentity,
         syncMode: syncMode
       )
       span.setAttribute(key: "resume.source", value: resumedSyncState.source.rawValue)
-      let tracker = moveOutTracker(streamStateKey: streamStateKey)
       if !forceFullBootstrap {
-        _ = try rebuildSimpleTrackerIfAdmissible(
+        _ = try await rebuildSimpleTrackerIfAdmissible(
           T.self,
           identity: replicaIdentity,
           resumedState: resumedSyncState,
@@ -2528,7 +2591,7 @@ public actor ElectricSyncClientImpl {
         if forceFullBootstrap {
           false
         } else {
-          try admitsFreshOnDemandStaticSimple(
+          try await admitsFreshOnDemandStaticSimple(
             T.self,
             resumedState: resumedSyncState,
             syncMode: syncMode,
@@ -2664,14 +2727,16 @@ public actor ElectricSyncClientImpl {
         shapeTopology,
         streamStateKey: streamStateKey
       )
-      let resumedSyncState = try resumeSyncState(
+      // Take the tracker before the resume reads suspend this actor; see
+      // `requestSnapshot`.
+      let tracker = moveOutTracker(streamStateKey: streamStateKey)
+      let resumedSyncState = try await resumeSyncState(
         identity: replicaIdentity,
         syncMode: syncMode
       )
       connectSpan.setAttribute(key: "resume.source", value: resumedSyncState.source.rawValue)
       let syncState = resumedSyncState.state
-      let tracker = moveOutTracker(streamStateKey: streamStateKey)
-      _ = try rebuildSimpleTrackerIfAdmissible(
+      _ = try await rebuildSimpleTrackerIfAdmissible(
         T.self,
         identity: replicaIdentity,
         resumedState: resumedSyncState,
@@ -2795,7 +2860,7 @@ public actor ElectricSyncClientImpl {
               requestLogMode: requestLogMode
             )
             let applicationBatch = batch.wireResetProjection()
-            try applicationBatch.preflightSupportedEvents()
+            try await applicationBatch.preflightSupportedEvents()
             await self.recordMessages(applicationBatch.messages)
             continuation.yield(applicationBatch)
             batchSpan.end(status: .success)
@@ -2850,14 +2915,13 @@ public actor ElectricSyncClientImpl {
     let predicateHash = PredicateHash(from: predicate)
     let predicateJSON = predicate?.encodedPredicateJSON() ?? predicate?.normalized()
 
-    try metadataProvider.recordFetch(
+    try await metadataProvider.recordFetch(
       table: type.tableName,
       predicate: predicateHash,
       predicateJSON: predicateJSON,
       snapshotBoundary: nil,
       outcome: .present,
-      isComplete: true,
-      transaction: nil
+      isComplete: true
     )
   }
 
@@ -3213,21 +3277,20 @@ public actor ElectricSyncClientImpl {
     return provided
   }
 
-  private func exactSyncState(identity: ElectricReplicaIdentity) throws -> SyncState? {
-    try metadataProvider.getSyncState(
-      collectionId: identity.persistedCursorKey,
-      transaction: nil
-    )
+  private func exactSyncState(identity: ElectricReplicaIdentity) async throws -> SyncState? {
+    try await metadataProvider.getSyncState(collectionId: identity.persistedCursorKey)
   }
 
-  private func legacyCursorCount(identity: ElectricReplicaIdentity) throws -> Int {
-    try identity.legacyPersistedCursorKeys.reduce(into: 0) { count, key in
-      if try metadataProvider.getSyncState(collectionId: key, transaction: nil)?
+  private func legacyCursorCount(identity: ElectricReplicaIdentity) async throws -> Int {
+    var count = 0
+    for key in identity.legacyPersistedCursorKeys {
+      if try await metadataProvider.getSyncState(collectionId: key)?
         .canResumeWithoutFullBootstrap == true
       {
         count += 1
       }
     }
+    return count
   }
 
   private func legacyCursorEvidenceCount(identity: ElectricReplicaIdentity) async throws -> Int {
@@ -3260,10 +3323,13 @@ public actor ElectricSyncClientImpl {
   private func rollbackStreamStateKeys(
     identity: ElectricReplicaIdentity,
     matching exactState: SyncState
-  ) throws -> [String] {
+  ) async throws -> [String] {
     guard !identity.provenLegacyPersistedCursorKeys.isEmpty else { return [] }
-    let keyedStates = try identity.provenLegacyPersistedCursorKeys.compactMap { key in
-      try metadataProvider.getSyncState(collectionId: key, transaction: nil).map { (key, $0) }
+    var keyedStates: [(String, SyncState)] = []
+    for key in identity.provenLegacyPersistedCursorKeys {
+      if let state = try await metadataProvider.getSyncState(collectionId: key) {
+        keyedStates.append((key, state))
+      }
     }
     guard let first = keyedStates.first?.1, first.hasSameResumeIdentity(as: exactState) else {
       return []
@@ -3274,20 +3340,30 @@ public actor ElectricSyncClientImpl {
     return keyedStates.map(\.0)
   }
 
-  private func invalidationStreamStateKeys(identity: ElectricReplicaIdentity) throws -> [String] {
-    try identity.provenLegacyPersistedCursorKeys.filter {
-      try metadataProvider.getSyncState(collectionId: $0, transaction: nil) != nil
+  private func invalidationStreamStateKeys(
+    identity: ElectricReplicaIdentity
+  ) async throws -> [String] {
+    var keys: [String] = []
+    for key in identity.provenLegacyPersistedCursorKeys {
+      if try await metadataProvider.getSyncState(collectionId: key) != nil {
+        keys.append(key)
+      }
     }
+    return keys
   }
 
+  /// Every read and the adoption write here go through the provider's async
+  /// requirements: this actor runs on the Swift concurrency pool, and a
+  /// synchronous call outside a transaction holds a pool thread until the
+  /// provider gets a pooled reader or the writer (OTTO-5325). The reads touch
+  /// no actor state, so the suspensions cannot interleave with it.
   private func resumeSyncState(
     identity: ElectricReplicaIdentity,
     syncMode: ElectricCollectionSyncMode
-  ) throws -> ResumedSyncState {
+  ) async throws -> ResumedSyncState {
     guard isExactCursorCutoverEnabled else {
-      let state = try metadataProvider.getSyncState(
-        collectionId: identity.legacyPersistedCursorKey(syncMode: syncMode),
-        transaction: nil
+      let state = try await metadataProvider.getSyncState(
+        collectionId: identity.legacyPersistedCursorKey(syncMode: syncMode)
       )
       // A bridge attestation upgrades the classification: the state under this
       // mode's key was atomically migrated from another compatible mode by the
@@ -3303,37 +3379,36 @@ public actor ElectricSyncClientImpl {
       )
     }
 
-    if let state = try exactSyncState(identity: identity) {
+    if let state = try await exactSyncState(identity: identity) {
       return ResumedSyncState(
         state: state,
         source: .exact,
-        rollbackStreamStateKeys: try rollbackStreamStateKeys(
+        rollbackStreamStateKeys: try await rollbackStreamStateKeys(
           identity: identity,
           matching: state
         ),
-        invalidationStreamStateKeys: try invalidationStreamStateKeys(identity: identity)
+        invalidationStreamStateKeys: try await invalidationStreamStateKeys(identity: identity)
       )
     }
 
     if !identity.provenLegacyPersistedCursorKeys.isEmpty,
-      let adopted = try metadataProvider.adoptSyncState(
+      let adopted = try await metadataProvider.adoptSyncState(
         collectionId: identity.persistedCursorKey,
-        legacyCollectionIds: identity.provenLegacyPersistedCursorKeys,
-        transaction: nil
+        legacyCollectionIds: identity.provenLegacyPersistedCursorKeys
       )
     {
       return ResumedSyncState(
         state: adopted,
         source: .legacyAdopted,
-        rollbackStreamStateKeys: try rollbackStreamStateKeys(
+        rollbackStreamStateKeys: try await rollbackStreamStateKeys(
           identity: identity,
           matching: adopted
         ),
-        invalidationStreamStateKeys: try invalidationStreamStateKeys(identity: identity)
+        invalidationStreamStateKeys: try await invalidationStreamStateKeys(identity: identity)
       )
     }
 
-    let legacyCursorCount = try legacyCursorCount(identity: identity)
+    let legacyCursorCount = try await legacyCursorCount(identity: identity)
     let source: ResumeSource
     if legacyCursorCount > 0 {
       guard ElectricLegacyBootstrapScope.admission?.identity == identity else {
