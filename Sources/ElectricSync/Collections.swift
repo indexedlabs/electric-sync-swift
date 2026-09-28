@@ -1396,7 +1396,7 @@ public struct ElectricCollection<T: ElectricCollectionModel>: Sendable {
           ) { batchSpan in
             let batchStart = runtimeProvider.now()
             let applicationBatch = batch.wireResetProjection()
-            try applicationBatch.preflightSupportedEvents()
+            try await applicationBatch.preflightSupportedEvents()
             let chunks = applicationBatch.chunked(maxMessages: electricBatchApplyChunkSize)
             batchSpan.setAttribute(key: "chunk.count", value: "\(chunks.count)")
             var pendingHydrationKeys = Set<String>()
@@ -1648,7 +1648,7 @@ public struct ElectricCollection<T: ElectricCollectionModel>: Sendable {
           isReplacementBootstrap: Bool = false
         ) async throws -> AppliedBatchResult {
           let applicationBatch = batch.wireResetProjection()
-          try applicationBatch.preflightSupportedEvents()
+          try await applicationBatch.preflightSupportedEvents()
           let replacesSnapshotState =
             isReplacementBootstrap || applicationBatch.containsFullSnapshotBoundary
           let finishesProgressiveInitialBuffering = applicationBatch.messages.contains(where: {
@@ -2584,7 +2584,7 @@ actor ElectricCollectionBackgroundCoordinator<T: ElectricCollectionModel> {
                   )
                 }
               if let loadedBatch {
-                try loadedBatch.wireResetProjection().preflightSupportedEvents()
+                try await loadedBatch.wireResetProjection().preflightSupportedEvents()
                 for (key, value) in electricMessageAttributes(loadedBatch.messages) {
                   span.setAttribute(key: key, value: value)
                 }

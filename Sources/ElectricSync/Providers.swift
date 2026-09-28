@@ -1,7 +1,14 @@
 import Foundation
 
 /// Tracks fetch + sync metadata outside of the cache.
-/// Calls are synchronous; implementations may optionally honor an opaque transaction context.
+///
+/// A call that receives the owner's transaction is synchronous and runs on that
+/// transaction's connection. A call made outside any transaction goes through
+/// an async requirement instead: ElectricSync makes those calls from actors on
+/// the Swift concurrency pool, so a provider backed by a connection pool must
+/// suspend while it waits for a connection rather than block a pool thread.
+/// Each async requirement's default calls its synchronous twin with a nil
+/// transaction, which keeps existing providers working unchanged.
 public protocol MetadataProvider: Sendable {
   var supportsDurableRowOwnership: Bool { get }
   /// Whether this provider can atomically clear every ownership/tag/deferred
@@ -11,7 +18,11 @@ public protocol MetadataProvider: Sendable {
   var supportsExclusiveWorkingSetReset: Bool { get }
 
   func hasFetched(table: String, predicate: PredicateHash, transaction: Any?) throws -> Bool
+  /// Reads fetch coverage outside any transaction without blocking the caller.
+  func hasFetched(table: String, predicate: PredicateHash) async throws -> Bool
   func getFetchedPredicates(table: String, transaction: Any?) throws -> [FetchedPredicate]
+  /// Reads fetch coverage outside any transaction without blocking the caller.
+  func getFetchedPredicates(table: String) async throws -> [FetchedPredicate]
   func recordFetch(
     table: String,
     predicate: PredicateHash,
@@ -21,6 +32,16 @@ public protocol MetadataProvider: Sendable {
     isComplete: Bool,
     transaction: Any?
   ) throws
+  /// Records fetch coverage in its own write, outside any owner transaction,
+  /// without blocking the caller while the writer is busy.
+  func recordFetch(
+    table: String,
+    predicate: PredicateHash,
+    predicateJSON: String?,
+    snapshotBoundary: PostgresSnapshot?,
+    outcome: SubsetObservationOutcome,
+    isComplete: Bool
+  ) async throws
   func recordFetch(
     table: String,
     predicate: PredicateHash,
@@ -36,6 +57,10 @@ public protocol MetadataProvider: Sendable {
     predicate: PredicateHash,
     transaction: Any?
   ) throws -> SubsetObservation?
+  /// Reads the latest subset observation outside any transaction without
+  /// blocking the caller.
+  func getLatestObservation(table: String, predicate: PredicateHash) async throws
+    -> SubsetObservation?
   func recordObservation(
     table: String,
     predicate: PredicateHash,
@@ -62,9 +87,9 @@ public protocol MetadataProvider: Sendable {
 
   func getSyncState(collectionId: String, transaction: Any?) throws -> SyncState?
   /// Reads committed sync state outside any transaction without blocking the
-  /// calling thread. Legacy-bootstrap admission calls this from the client
-  /// actor, which runs on the Swift concurrency pool; a provider backed by a
-  /// connection pool must suspend while it waits for a connection instead of
+  /// calling thread. Legacy-bootstrap admission, stream resume, and batch
+  /// preflight call this from the Swift concurrency pool; a provider backed by
+  /// a connection pool must suspend while it waits for a connection instead of
   /// blocking a pool thread. The default calls the synchronous requirement.
   func getSyncState(collectionId: String) async throws -> SyncState?
   func updateSyncState(collectionId: String, state: SyncState, transaction: Any?) throws
@@ -76,6 +101,10 @@ public protocol MetadataProvider: Sendable {
     legacyCollectionIds: [String],
     transaction: Any?
   ) throws -> SyncState?
+  /// Adopts a legacy resume identity in its own write, outside any owner
+  /// transaction, without blocking the caller while the writer is busy.
+  func adoptSyncState(collectionId: String, legacyCollectionIds: [String]) async throws
+    -> SyncState?
 
   func claimRowOwnership(
     table: String,
@@ -117,6 +146,13 @@ public protocol MetadataProvider: Sendable {
     localTableOwnership: ElectricLocalTableOwnership,
     transaction: Any?
   ) throws -> [String: [String]]?
+  /// Reads tracker-rebuild ownership outside any transaction without blocking
+  /// the caller.
+  func trackerRebuildOwnership(
+    table: String,
+    shapeIdentity: String,
+    localTableOwnership: ElectricLocalTableOwnership
+  ) async throws -> [String: [String]]?
   /// Admits the one safe fresh-owner shortcut: no durable Electric ownership,
   /// coverage, or ownership-coordination evidence from any generation, plus
   /// no unowned rows for an exclusive local table.
@@ -125,6 +161,12 @@ public protocol MetadataProvider: Sendable {
     localTableOwnership: ElectricLocalTableOwnership,
     transaction: Any?
   ) throws -> Bool
+  /// Reads pristine-owner admission outside any transaction without blocking
+  /// the caller.
+  func admitsFreshOnDemandPristineOwner(
+    table: String,
+    localTableOwnership: ElectricLocalTableOwnership
+  ) async throws -> Bool
   func updateRowOwnership(
     table: String,
     shapeIdentity: String,
@@ -151,6 +193,33 @@ public protocol MetadataProvider: Sendable {
 extension MetadataProvider {
   public var supportsDurableRowOwnership: Bool { false }
   public var supportsExclusiveWorkingSetReset: Bool { false }
+
+  public func hasFetched(table: String, predicate: PredicateHash) async throws -> Bool {
+    try hasFetched(table: table, predicate: predicate, transaction: nil)
+  }
+
+  public func getFetchedPredicates(table: String) async throws -> [FetchedPredicate] {
+    try getFetchedPredicates(table: table, transaction: nil)
+  }
+
+  public func recordFetch(
+    table: String,
+    predicate: PredicateHash,
+    predicateJSON: String?,
+    snapshotBoundary: PostgresSnapshot?,
+    outcome: SubsetObservationOutcome,
+    isComplete: Bool
+  ) async throws {
+    try recordFetch(
+      table: table,
+      predicate: predicate,
+      predicateJSON: predicateJSON,
+      snapshotBoundary: snapshotBoundary,
+      outcome: outcome,
+      isComplete: isComplete,
+      transaction: nil
+    )
+  }
 
   public func recordFetch(
     table: String,
@@ -189,6 +258,12 @@ extension MetadataProvider {
     nil
   }
 
+  public func getLatestObservation(table: String, predicate: PredicateHash) async throws
+    -> SubsetObservation?
+  {
+    try getLatestObservation(table: table, predicate: predicate, transaction: nil)
+  }
+
   public func recordObservation(
     table _: String,
     predicate _: PredicateHash,
@@ -224,6 +299,16 @@ extension MetadataProvider {
     }
     try updateSyncState(collectionId: collectionId, state: first, transaction: transaction)
     return first
+  }
+
+  public func adoptSyncState(collectionId: String, legacyCollectionIds: [String]) async throws
+    -> SyncState?
+  {
+    try adoptSyncState(
+      collectionId: collectionId,
+      legacyCollectionIds: legacyCollectionIds,
+      transaction: nil
+    )
   }
 
   public func claimRowOwnership(
@@ -301,6 +386,19 @@ extension MetadataProvider {
     )
   }
 
+  public func trackerRebuildOwnership(
+    table: String,
+    shapeIdentity: String,
+    localTableOwnership: ElectricLocalTableOwnership
+  ) async throws -> [String: [String]]? {
+    try trackerRebuildOwnership(
+      table: table,
+      shapeIdentity: shapeIdentity,
+      localTableOwnership: localTableOwnership,
+      transaction: nil
+    )
+  }
+
   /// Conservative by default: only storage that can inspect every durable
   /// ownership identity and the local table may admit a fresh shortcut.
   public func admitsFreshOnDemandPristineOwner(
@@ -309,6 +407,17 @@ extension MetadataProvider {
     transaction _: Any?
   ) throws -> Bool {
     false
+  }
+
+  public func admitsFreshOnDemandPristineOwner(
+    table: String,
+    localTableOwnership: ElectricLocalTableOwnership
+  ) async throws -> Bool {
+    try admitsFreshOnDemandPristineOwner(
+      table: table,
+      localTableOwnership: localTableOwnership,
+      transaction: nil
+    )
   }
 
   public func updateRowOwnership(
