@@ -422,6 +422,20 @@ public final class ElectricShapeReplica<Model: ElectricCollectionModel>: @unchec
     return isCurrent
   }
 
+  /// Captures the lease set an actor-owned recovery seed publishes for. Like
+  /// the tail admission, a release of the final lease invalidates it
+  /// synchronously, so the seed's in-transaction validation rolls back a
+  /// boundary that would otherwise commit rows after the last lease is gone.
+  func admitWorkingSetRecoverySeedPublication() -> ElectricReplicaDemandTailFence.Admission? {
+    demandTailFence.admitTailRequest()
+  }
+
+  func isWorkingSetRecoverySeedPublicationCurrent(
+    _ admission: ElectricReplicaDemandTailFence.Admission
+  ) -> Bool {
+    demandTailFence.isCurrent(admission)
+  }
+
   /// Internal deterministic test seams. They are deliberately unavailable to
   /// package clients and only observe lifecycle handoffs; production behavior
   /// is unchanged when no observer is installed.

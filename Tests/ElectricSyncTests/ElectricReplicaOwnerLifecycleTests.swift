@@ -1962,6 +1962,9 @@ struct ElectricReplicaOwnerLifecycleTests {
         ],
         syncMode: .onDemand,
         isExactCursorCutoverEnabled: true,
+        // activateDemand starts its own tail before it returns. Park that
+        // tail's first fetch so the seed is observed before any tail row.
+        blocksRequestIndexUntilResumed: 2,
         protocolCapabilityPolicy: .enabled,
         shapeTopology: .dnf,
         trackerContinuityRecoveryPolicy: .replaceExclusiveWorkingSetFromDemandedSubsets
@@ -1992,20 +1995,20 @@ struct ElectricReplicaOwnerLifecycleTests {
       #expect(!replica.isTrackerContinuityUnavailable)
       #expect(activation.result.appliedRecords.map(\.id) == [seedRecord.id])
       #expect(activation.result.localRecords.map(\.id) == [seedRecord.id])
+      try await waitUntilTrueAsync { await harness.http.requestCount() == 2 }
       #expect(harness.store.storedIDs() == [seedRecord.id])
       let requests = await harness.http.capturedRequests()
-      #expect(requests.count == 1)
+      #expect(requests.count == 2)
       #expect(requests[0].offset == "now")
       #expect(requests[0].subset?.whereClause == "id = $1")
       #expect(requests[0].log == .changesOnly)
       #expect(!requests.contains { $0.offset == "-1" && $0.subset == nil })
+      #expect(requests[1].offset == "offset-seed")
+      #expect(requests[1].subset == nil)
+      #expect(requests[1].log == .changesOnly)
 
-      let token = harness.collection.keepSynced(session: session)
-      defer { token.cancel() }
+      await harness.http.resumeBlockedFetch()
       try await waitUntilTrueAsync { harness.store.storedIDs().contains(tailRecord.id) }
-      let tailRequest = try #require((await harness.http.capturedRequests()).dropFirst().first)
-      #expect(tailRequest.offset == "offset-seed")
-      #expect(tailRequest.log == .changesOnly)
     }
   }
 
@@ -2567,6 +2570,7 @@ struct ElectricReplicaOwnerLifecycleTests {
     let recoveredFirst = ReplicaTestRecord(id: "first", name: "Recovered first")
     let recoveredSecond = ReplicaTestRecord(id: "second", name: "Recovered second")
     let recordMutationGate = ReplicaRecordMutationGate(blockedInvocation: 5)
+    let transactionProbe = ReplicaTransactionProbe()
     let harness = ReplicaHarness<ReplicaTestRecord>(
       responses: [
         [
@@ -2599,6 +2603,7 @@ struct ElectricReplicaOwnerLifecycleTests {
       isExactCursorCutoverEnabled: true,
       blocksRequestIndexUntilResumed: 4,
       recordMutationGate: recordMutationGate,
+      transactionProbe: transactionProbe,
       protocolCapabilityPolicy: .enabled,
       shapeTopology: .dnf,
       trackerContinuityRecoveryPolicy: .replaceExclusiveWorkingSetFromDemandedSubsets,
@@ -2619,14 +2624,22 @@ struct ElectricReplicaOwnerLifecycleTests {
     await harness.http.resumeBlockedFetch()
     try await waitUntilTrueAsync { await harness.http.requestCount() == 6 }
     try await waitUntilTrue { recordMutationGate.hasEntered }
+    // The gate holds the recovered `second` seed inside its transaction.
+    let blockedSeedTransaction = await transactionProbe.latestInvocation()
 
     activation.lease.cancel()
     recordMutationGate.release()
+    // Wait for the seed's transaction to finish either way; asserting on the
+    // store before then would pass while the row was still about to commit.
+    try await waitUntilTrueAsync {
+      await transactionProbe.outcome(for: blockedSeedTransaction) != nil
+    }
     try await waitUntilTrueAsync {
       await harness.collection.replica.activeDemandDescriptors().isEmpty
     }
     await Task.yield()
 
+    #expect(await transactionProbe.outcome(for: blockedSeedTransaction) == .rolledBack)
     #expect(await harness.http.requestCount() == 6)
     #expect(!(await harness.collection.replica.isWorkingSetTailRunnable))
     #expect(!harness.store.storedIDs().contains(recoveredSecond.id))
@@ -5678,6 +5691,10 @@ private actor ReplicaTransactionProbe {
   func begin() -> Int {
     nextInvocation += 1
     return nextInvocation
+  }
+
+  func latestInvocation() -> Int {
+    nextInvocation
   }
 
   func record(_ invocation: Int, outcome: Outcome) {

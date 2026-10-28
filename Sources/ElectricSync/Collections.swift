@@ -2331,6 +2331,19 @@ actor ElectricCollectionBackgroundCoordinator<T: ElectricCollectionModel> {
           throw ElectricWorkingSetRecoveryRetry()
         }
       }
+      // A running tail can lead this seed while a raw token keeps the stream
+      // alive after the final lease is cancelled, so this task is never
+      // cancelled. Fence the seed on the synchronous lease set instead: once
+      // the last lease goes away, the seed must not publish its rows.
+      let recoverySeedDemandAdmission: ElectricReplicaDemandTailFence.Admission?
+      if isActorOwnedWorkingSetRecoverySeed, let snapshotReplica {
+        guard let admission = snapshotReplica.admitWorkingSetRecoverySeedPublication() else {
+          throw CancellationError()
+        }
+        recoverySeedDemandAdmission = admission
+      } else {
+        recoverySeedDemandAdmission = nil
+      }
       let isSessionCurrent: @Sendable () -> Bool = {
         guard let session else { return false }
         return client.sessionProvider.isCurrent(session)
@@ -2743,6 +2756,13 @@ actor ElectricCollectionBackgroundCoordinator<T: ElectricCollectionModel> {
                   validatePublication: {
                     try Task.checkCancellation()
                     guard isSessionCurrent() else { throw CancellationError() }
+                    if let recoverySeedDemandAdmission,
+                      snapshotReplica?.isWorkingSetRecoverySeedPublicationCurrent(
+                        recoverySeedDemandAdmission
+                      ) != true
+                    {
+                      throw CancellationError()
+                    }
                     if let progressiveGeneration,
                       snapshotReplica?.isProgressiveSnapshotGenerationCurrent(
                         progressiveGeneration
